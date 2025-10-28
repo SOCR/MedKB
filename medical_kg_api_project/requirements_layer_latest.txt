@@ -1,0 +1,6 @@
+fastapi
+mangum
+neo4j
+openai
+pydantic
+starlette 

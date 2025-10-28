@@ -1,0 +1,27 @@
+# =============================================================================
+# PIPELINE REQUIREMENTS - For building the knowledge graph locally
+# Use this for: python run_pipeline.py
+# =============================================================================
+
+# AWS Services
+boto3>=1.34.0,<1.37.0
+botocore>=1.34.0,<1.37.4
+
+# Database Drivers
+neo4j>=5.28.0
+psycopg2-binary>=2.9.0
+
+# Text Processing & Embeddings
+sentence-transformers>=3.0.0
+
+# LlamaIndex - Only what the pipeline actually uses
+llama-index-core>=0.13.0,<0.15.0
+llama-index-llms-bedrock>=0.4.0
+
+# Scientific Computing
+numpy<2.0.0
+scipy<1.12.0
+
+# Utilities
+requests>=2.31.0
+

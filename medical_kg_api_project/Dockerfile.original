@@ -1,0 +1,15 @@
+# Use the official AWS Lambda Python 3.11 base image
+FROM public.ecr.aws/lambda/python:3.11
+
+# Copy requirements first for better caching
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+
+# Install Python dependencies
+RUN pip install -r requirements.txt --no-cache-dir
+
+# Copy application code
+COPY main.py ${LAMBDA_TASK_ROOT}/
+COPY lambda_handler.py ${LAMBDA_TASK_ROOT}/
+
+# Set the handler
+CMD ["lambda_handler.handler"]

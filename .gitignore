@@ -1,0 +1,48 @@
+# UMLS data files (large, don't commit)
+MRCONSO.RRF
+*.RRF
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+venv*/
+env*/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Neo4j
+*.db
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large data files
+*.zip
+data_corpus/*.txt
+umls-2025AA-mrconso*/
+
+# Jupyter notebooks (contain API keys in output)
+*.ipynb
+.ipynb_checkpoints/
+
+# Secrets
+.env
+*.key
+*.pem
+env-vars.json
+/.specstory
