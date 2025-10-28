@@ -15,6 +15,7 @@ import json
 import argparse
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from neo4j import GraphDatabase
 import boto3
 import psycopg2
@@ -61,6 +62,75 @@ def format_time(seconds):
     else:
         hours = seconds / 3600
         return f"{hours:.2f}h"
+
+# =============================================================================
+# OUTPUT DIRECTORY AND JSON STORAGE
+# =============================================================================
+OUTPUT_DIR = Path("output")
+
+def ensure_output_directory():
+    """Create output directory if it doesn't exist."""
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    console.print(f"  📁 Output directory: {OUTPUT_DIR.absolute()}")
+
+def save_batch_json(batch_number, chunk_range, nodes, relationships, processing_time):
+    """Save batch data to JSON file."""
+    batch_file = OUTPUT_DIR / f"batch_{batch_number:04d}.json"
+    
+    batch_data = {
+        "batch_number": batch_number,
+        "chunk_range": {
+            "start": chunk_range[0],
+            "end": chunk_range[1]
+        },
+        "timestamp": datetime.now().isoformat(),
+        "processing_time_seconds": round(processing_time, 2),
+        "nodes": nodes,
+        "relationships": relationships,
+        "stats": {
+            "nodes_count": len(nodes),
+            "relationships_count": len(relationships)
+        }
+    }
+    
+    with open(batch_file, 'w', encoding='utf-8') as f:
+        json.dump(batch_data, f, indent=2, ensure_ascii=False)
+    
+    return batch_file
+
+def save_pipeline_metadata(total_batches, total_chunks, total_nodes, total_rels, start_time, end_time):
+    """Save pipeline summary metadata."""
+    metadata_file = OUTPUT_DIR / "pipeline_metadata.json"
+    
+    duration = end_time - start_time
+    
+    metadata = {
+        "pipeline_version": "1.0",
+        "run_info": {
+            "total_batches": total_batches,
+            "total_chunks_processed": total_chunks,
+            "start_time": datetime.fromtimestamp(start_time).isoformat(),
+            "end_time": datetime.fromtimestamp(end_time).isoformat(),
+            "duration_seconds": round(duration, 2),
+            "duration_human": format_time(duration)
+        },
+        "results": {
+            "total_nodes": total_nodes,
+            "total_relationships": total_rels,
+            "avg_nodes_per_chunk": round(total_nodes / total_chunks, 2) if total_chunks > 0 else 0,
+            "avg_relationships_per_chunk": round(total_rels / total_chunks, 2) if total_chunks > 0 else 0
+        },
+        "output_files": {
+            "batch_files_pattern": "batch_####.json",
+            "batch_files_count": total_batches,
+            "batch_files_location": str(OUTPUT_DIR.absolute())
+        }
+    }
+    
+    with open(metadata_file, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2)
+    
+    return metadata_file
 
 # =============================================================================
 # CHECKPOINT FUNCTIONALITY
@@ -200,6 +270,10 @@ def main():
         # Change to 'all-MiniLM-L6-v2' if you need faster/lighter
         embedding_model = SentenceTransformer('all-mpnet-base-v2')
         print("  ✅ Embedding model loaded (all-mpnet-base-v2, 768 dimensions)")
+        
+        # 1f. Create output directory for JSON files
+        print("  🔧 Setting up output directory...")
+        ensure_output_directory()
         
         print("\n✅ All services initialized successfully!\n")
         
@@ -464,6 +538,9 @@ def main():
                         
                         console.log(f"[green]✅ Batch {batch_idx + 1} loaded successfully![/green]")
                         
+                        # Calculate batch processing time
+                        batch_processing_time = time.time() - batch_start_time
+                        
                         # Save checkpoint after successful batch
                         save_checkpoint(
                             chunk_index=abs_end - 1,  # Last chunk in this batch
@@ -472,6 +549,16 @@ def main():
                             relationships_loaded=total_relationships_loaded
                         )
                         console.log(f"💾 Checkpoint saved")
+                        
+                        # Save batch data to JSON
+                        batch_file = save_batch_json(
+                            batch_number=batch_idx + 1,
+                            chunk_range=(abs_start, abs_end - 1),
+                            nodes=all_enriched_nodes,
+                            relationships=all_enriched_relationships,
+                            processing_time=batch_processing_time
+                        )
+                        console.log(f"[cyan]📄 JSON saved: {batch_file.name}[/cyan]")
                         
                     except Exception as e:
                         console.log(f"[red]❌ Error loading batch to Neo4j: {e}[/red]")
@@ -544,6 +631,18 @@ def main():
             rels_per_sec = total_relationships_loaded / total_elapsed
             print(f"  • Throughput: {nodes_per_sec:.1f} nodes/s, {rels_per_sec:.1f} rels/s")
     
+    # Save final pipeline metadata
+    print(f"\n📄 Saving pipeline metadata...")
+    metadata_file = save_pipeline_metadata(
+        total_batches=num_batches,
+        total_chunks=len(text_nodes),
+        total_nodes=total_nodes_loaded,
+        total_rels=total_relationships_loaded,
+        start_time=pipeline_start_time,
+        end_time=time.time()
+    )
+    print(f"  ✅ Metadata saved: {metadata_file}")
+    
     # Mark checkpoint as complete
     if start_chunk + len(text_nodes) >= original_chunk_count or not TEST_MODE:
         mark_checkpoint_complete(total_nodes_loaded, total_relationships_loaded)
@@ -557,6 +656,11 @@ def main():
     print(f"  • Resume from checkpoint: python run_pipeline.py --resume")
     print(f"  • Start from specific chunk: python run_pipeline.py --start-chunk N")
     print(f"  • Process all chunks: python run_pipeline.py --full-run")
+    
+    print(f"\n📂 Output Files:")
+    print(f"  • JSON batches: {OUTPUT_DIR.absolute()}")
+    print(f"  • Batch files: {num_batches} files (batch_####.json)")
+    print(f"  • Metadata: pipeline_metadata.json")
     
     print(f"\n✅ Access your graph at: http://localhost:7474")
     print(f"   Username: neo4j")

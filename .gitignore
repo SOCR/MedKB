@@ -49,4 +49,7 @@ env-vars.json
 # Pipeline checkpoint files (local progress tracking)
 pipeline_checkpoint.json
 
+# Pipeline output files (JSON batches)
+output/
+
 /.specstory
