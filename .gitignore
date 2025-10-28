@@ -45,4 +45,8 @@ umls-2025AA-mrconso*/
 *.key
 *.pem
 env-vars.json
+
+# Pipeline checkpoint files (local progress tracking)
+pipeline_checkpoint.json
+
 /.specstory

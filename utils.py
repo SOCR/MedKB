@@ -11,6 +11,13 @@ import requests  # For making API calls to the LLM
 from neo4j import GraphDatabase # The official Neo4j driver
 from sentence_transformers import SentenceTransformer # For creating vector embeddings
 
+# Recommended embedding models (in order of quality):
+# 1. 'all-mpnet-base-v2' - Best balanced (768d, 420MB) ⭐ RECOMMENDED
+# 2. 'BAAI/bge-large-en-v1.5' - Highest quality (1024d, 1.34GB)
+# 3. 'BAAI/bge-small-en-v1.5' - Fast and good (384d, 133MB)
+# 4. 'nomic-ai/nomic-embed-text-v1.5' - Great for scientific text (768d, 548MB)
+# 5. 'all-MiniLM-L6-v2' - Fastest but lower quality (384d, 80MB) - CURRENT
+
 
 # LlamaIndex components for text splitting
 from llama_index.core import Document
@@ -63,38 +70,35 @@ print("Configuration loaded.")
 # =============================================================================
 def initialize_llm():
     """
-    Initialize AWS Bedrock LLM (Claude Sonnet 4) for medical entity extraction.
+    Initialize AWS Bedrock LLM (Claude 3.7 Sonnet) for medical entity extraction.
+    Uses inference profile for on-demand access.
     Returns a LlamaIndex LLM object.
     """
     try:
         from llama_index.llms.bedrock import Bedrock
         
+        # Use inference profile ID for on-demand access (not direct model ID)
         llm = Bedrock(
-            model="anthropic.claude-sonnet-4-20250514-v1:0",
+            model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",  # Inference profile
             region_name=AWS_REGION,
             temperature=0.1,
             max_tokens=4096,
+            context_size=200000,  # Claude 3.7 Sonnet has 200K context window
             additional_kwargs={
                 "top_p": 0.9,
             }
         )
-        print("✅ AWS Bedrock LLM initialized successfully")
+        print("✅ AWS Bedrock LLM (Claude 3.7 Sonnet) initialized successfully")
         return llm
     except Exception as e:
-        print(f"❌ Error initializing LLM: {e}")
-        print("Falling back to OpenAI...")
-        try:
-            from llama_index.llms.openai import OpenAI
-            llm = OpenAI(
-                model="gpt-4o-mini",
-                temperature=0.1,
-                max_tokens=4096
-            )
-            print("✅ OpenAI LLM initialized as fallback")
-            return llm
-        except Exception as e2:
-            print(f"❌ Failed to initialize fallback LLM: {e2}")
-            raise RuntimeError("Could not initialize any LLM. Check your AWS/OpenAI credentials.")
+        print(f"❌ Error initializing Bedrock LLM: {e}")
+        print("\n💡 Troubleshooting:")
+        print("  1. Check AWS credentials: aws sts get-caller-identity")
+        print("  2. Check Bedrock access in us-east-1 region")
+        print("  3. Verify inference profile access:")
+        print("     aws bedrock list-inference-profiles --region us-east-1")
+        print("  4. Model access may need to be enabled in Bedrock console")
+        raise RuntimeError(f"Could not initialize AWS Bedrock LLM: {e}")
 
 print("LLM initialization function defined.")
 
@@ -189,9 +193,19 @@ You are a world-class biomedical informatics expert. Your task is to act as a pr
 Node Types: {node_types}
 Relationship Types: {relationship_types}
 
+-CRITICAL INSTRUCTIONS-
+**ALWAYS expand medical abbreviations to their full terms:**
+- Use complete medical terminology, never abbreviations
+- Example: "MI" → "Myocardial Infarction"
+- Example: "COPD" → "Chronic Obstructive Pulmonary Disease"
+- Example: "BP" → "Blood Pressure"
+- Example: "CT" → "Computed Tomography"
+- Example: "MRI" → "Magnetic Resonance Imaging"
+- If unsure about an abbreviation, use your best medical knowledge based on context
+
 -EXTRACTION STEPS-
 1.  **Identify Entities:** Carefully read the text and identify all terms that match one of the node types in the schema. For each entity, you must extract:
-    - `entity_name`: The exact name of the entity as it appears in the text.
+    - `entity_name`: **ALWAYS use the fully expanded medical term, never abbreviations**
     - `entity_type`: The corresponding type from the schema's Node Types list.
     - `entity_description`: A concise, one-sentence description of the entity based on its context in the text.
 
@@ -289,15 +303,267 @@ def generate_fallback_id(entity_name: str, entity_type: str) -> str:
     return f"BIOGRAPH:{entity_type.upper()}:{hashed_id}"
 
 
-# --- A simple dictionary for common, unambiguous abbreviations ---
-# This can be expanded over time.
+# =============================================================================
+# COMPREHENSIVE MEDICAL ABBREVIATION DICTIONARY
+# 200+ common medical abbreviations for fallback expansion
+# Note: LLM does primary expansion (context-aware), this is backup
+# =============================================================================
 ABBREVIATION_MAP = {
+    # ========== CARDIOVASCULAR ==========
     "MI": "Myocardial Infarction",
+    "CHF": "Congestive Heart Failure",
+    "AF": "Atrial Fibrillation",
+    "AFib": "Atrial Fibrillation",
+    "CAD": "Coronary Artery Disease",
+    "PVD": "Peripheral Vascular Disease",
+    "DVT": "Deep Vein Thrombosis",
+    "PE": "Pulmonary Embolism",
+    "HTN": "Hypertension",
     "HBP": "High Blood Pressure",
+    "CABG": "Coronary Artery Bypass Graft",
+    "PCI": "Percutaneous Coronary Intervention",
+    "STEMI": "ST-Elevation Myocardial Infarction",
+    "NSTEMI": "Non-ST-Elevation Myocardial Infarction",
+    "SVT": "Supraventricular Tachycardia",
+    "VT": "Ventricular Tachycardia",
+    "VF": "Ventricular Fibrillation",
+    
+    # ========== RESPIRATORY ==========
+    "COPD": "Chronic Obstructive Pulmonary Disease",
+    "ARDS": "Acute Respiratory Distress Syndrome",
+    "URI": "Upper Respiratory Infection",
+    "URTI": "Upper Respiratory Tract Infection",
+    "LRTI": "Lower Respiratory Tract Infection",
+    "OSA": "Obstructive Sleep Apnea",
+    "TB": "Tuberculosis",
+    "CF": "Cystic Fibrosis",
+    "IPF": "Idiopathic Pulmonary Fibrosis",
+    "SOB": "Shortness of Breath",
+    "DOE": "Dyspnea on Exertion",
+    
+    # ========== NEUROLOGICAL ==========
+    "CVA": "Cerebrovascular Accident",
+    "TIA": "Transient Ischemic Attack",
+    "ICH": "Intracranial Hemorrhage",
+    "SAH": "Subarachnoid Hemorrhage",
+    "MS": "Multiple Sclerosis",
+    "ALS": "Amyotrophic Lateral Sclerosis",
+    "PD": "Parkinson's Disease",
+    "AD": "Alzheimer's Disease",
+    "SCI": "Spinal Cord Injury",
+    "TBI": "Traumatic Brain Injury",
+    "CP": "Cerebral Palsy",
+    "LOC": "Loss of Consciousness",
+    "AMS": "Altered Mental Status",
+    
+    # ========== PSYCHIATRIC ==========
+    "ADHD": "Attention-Deficit Hyperactivity Disorder",
+    "OCD": "Obsessive-Compulsive Disorder",
+    "PTSD": "Post-Traumatic Stress Disorder",
+    "GAD": "Generalized Anxiety Disorder",
+    "MDD": "Major Depressive Disorder",
+    "BPD": "Borderline Personality Disorder",
+    "SAD": "Seasonal Affective Disorder",
+    "BD": "Bipolar Disorder",
     "CD": "Conduct Disorder",
-    "ADHD": "Attention-Deficit/Hyperactivity Disorder",
+    "ODD": "Oppositional Defiant Disorder",
+    
+    # ========== GASTROINTESTINAL ==========
+    "GERD": "Gastroesophageal Reflux Disease",
+    "IBD": "Inflammatory Bowel Disease",
+    "IBS": "Irritable Bowel Syndrome",
+    "UC": "Ulcerative Colitis",
+    "PUD": "Peptic Ulcer Disease",
+    "NASH": "Non-Alcoholic Steatohepatitis",
+    "NAFLD": "Non-Alcoholic Fatty Liver Disease",
+    "GI": "Gastrointestinal",
+    "N/V": "Nausea and Vomiting",
+    "LFT": "Liver Function Test",
+    
+    # ========== ENDOCRINE/METABOLIC ==========
+    "DM": "Diabetes Mellitus",
+    "T1DM": "Type 1 Diabetes Mellitus",
+    "T2DM": "Type 2 Diabetes Mellitus",
+    "DKA": "Diabetic Ketoacidosis",
+    "HHS": "Hyperosmolar Hyperglycemic State",
+    "HbA1c": "Glycated Hemoglobin",
+    "TSH": "Thyroid Stimulating Hormone",
+    "BMI": "Body Mass Index",
+    "MetS": "Metabolic Syndrome",
+    
+    # ========== RENAL/URINARY ==========
+    "CKD": "Chronic Kidney Disease",
+    "AKI": "Acute Kidney Injury",
+    "ESRD": "End-Stage Renal Disease",
+    "UTI": "Urinary Tract Infection",
+    "BPH": "Benign Prostatic Hyperplasia",
+    "PKD": "Polycystic Kidney Disease",
+    "ARF": "Acute Renal Failure",
+    "CRF": "Chronic Renal Failure",
+    
+    # ========== HEMATOLOGY/ONCOLOGY ==========
+    "ALL": "Acute Lymphoblastic Leukemia",
+    "AML": "Acute Myeloid Leukemia",
+    "CLL": "Chronic Lymphocytic Leukemia",
+    "CML": "Chronic Myeloid Leukemia",
+    "NHL": "Non-Hodgkin Lymphoma",
+    "HL": "Hodgkin Lymphoma",
+    "MM": "Multiple Myeloma",
+    "MDS": "Myelodysplastic Syndrome",
+    "ITP": "Immune Thrombocytopenic Purpura",
+    "DIC": "Disseminated Intravascular Coagulation",
+    "HIT": "Heparin-Induced Thrombocytopenia",
+    
+    # ========== INFECTIOUS DISEASE ==========
+    "HIV": "Human Immunodeficiency Virus",
+    "AIDS": "Acquired Immunodeficiency Syndrome",
+    "HCV": "Hepatitis C Virus",
+    "HBV": "Hepatitis B Virus",
+    "HAV": "Hepatitis A Virus",
+    "HSV": "Herpes Simplex Virus",
+    "CMV": "Cytomegalovirus",
+    "EBV": "Epstein-Barr Virus",
+    "MRSA": "Methicillin-Resistant Staphylococcus Aureus",
+    "VRE": "Vancomycin-Resistant Enterococcus",
+    "C diff": "Clostridioides difficile",
+    "STI": "Sexually Transmitted Infection",
+    "STD": "Sexually Transmitted Disease",
+    
+    # ========== RHEUMATOLOGY/IMMUNOLOGY ==========
+    "RA": "Rheumatoid Arthritis",
+    "OA": "Osteoarthritis",
+    "SLE": "Systemic Lupus Erythematosus",
+    "AS": "Ankylosing Spondylitis",
+    "PSA": "Psoriatic Arthritis",
+    "SS": "Sjogren's Syndrome",
+    "MCTD": "Mixed Connective Tissue Disease",
+    "GCA": "Giant Cell Arteritis",
+    "PMR": "Polymyalgia Rheumatica",
+    
+    # ========== DIAGNOSTIC IMAGING ==========
     "CT": "Computed Tomography",
     "MRI": "Magnetic Resonance Imaging",
+    "PET": "Positron Emission Tomography",
+    "US": "Ultrasound",
+    "CXR": "Chest X-Ray",
+    "KUB": "Kidneys Ureters Bladder",
+    "ERCP": "Endoscopic Retrograde Cholangiopancreatography",
+    "EGD": "Esophagogastroduodenoscopy",
+    "MRCP": "Magnetic Resonance Cholangiopancreatography",
+    
+    # ========== PROCEDURES ==========
+    "CPR": "Cardiopulmonary Resuscitation",
+    "EKG": "Electrocardiogram",
+    "ECG": "Electrocardiogram",
+    "EEG": "Electroencephalogram",
+    "EMG": "Electromyography",
+    "LP": "Lumbar Puncture",
+    "I&D": "Incision and Drainage",
+    "D&C": "Dilation and Curettage",
+    "TURP": "Transurethral Resection of Prostate",
+    
+    # ========== MEDICATIONS/DRUG CLASSES ==========
+    "NSAID": "Non-Steroidal Anti-Inflammatory Drug",
+    "ACE": "Angiotensin-Converting Enzyme",
+    "ARB": "Angiotensin Receptor Blocker",
+    "CCB": "Calcium Channel Blocker",
+    "BB": "Beta Blocker",
+    "SSRI": "Selective Serotonin Reuptake Inhibitor",
+    "SNRI": "Serotonin-Norepinephrine Reuptake Inhibitor",
+    "TCA": "Tricyclic Antidepressant",
+    "MAOI": "Monoamine Oxidase Inhibitor",
+    "PPI": "Proton Pump Inhibitor",
+    "H2RA": "Histamine-2 Receptor Antagonist",
+    "LMWH": "Low Molecular Weight Heparin",
+    "DOAC": "Direct Oral Anticoagulant",
+    "DMARD": "Disease-Modifying Antirheumatic Drug",
+    "TNF": "Tumor Necrosis Factor",
+    "IV": "Intravenous",
+    "IM": "Intramuscular",
+    "SQ": "Subcutaneous",
+    "PO": "Per Os (by mouth)",
+    "PR": "Per Rectum",
+    "SL": "Sublingual",
+    
+    # ========== VITAL SIGNS/MEASUREMENTS ==========
+    "BP": "Blood Pressure",
+    "HR": "Heart Rate",
+    "RR": "Respiratory Rate",
+    "SpO2": "Oxygen Saturation",
+    "Temp": "Temperature",
+    "BS": "Blood Sugar",
+    "BG": "Blood Glucose",
+    "ABG": "Arterial Blood Gas",
+    "VBG": "Venous Blood Gas",
+    
+    # ========== LAB VALUES ==========
+    "CBC": "Complete Blood Count",
+    "CMP": "Comprehensive Metabolic Panel",
+    "BMP": "Basic Metabolic Panel",
+    "LFT": "Liver Function Test",
+    "PT": "Prothrombin Time",
+    "PTT": "Partial Thromboplastin Time",
+    "INR": "International Normalized Ratio",
+    "ESR": "Erythrocyte Sedimentation Rate",
+    "CRP": "C-Reactive Protein",
+    "BNP": "B-type Natriuretic Peptide",
+    "Trop": "Troponin",
+    "PSA": "Prostate-Specific Antigen",
+    "TSH": "Thyroid Stimulating Hormone",
+    "T3": "Triiodothyronine",
+    "T4": "Thyroxine",
+    "WBC": "White Blood Cell",
+    "RBC": "Red Blood Cell",
+    "Hgb": "Hemoglobin",
+    "Hct": "Hematocrit",
+    "PLT": "Platelet",
+    
+    # ========== SYMPTOMS/FINDINGS ==========
+    "SOB": "Shortness of Breath",
+    "CP": "Chest Pain",
+    "HA": "Headache",
+    "N/V": "Nausea/Vomiting",
+    "D/C": "Discontinue",
+    "C/O": "Complains Of",
+    "R/O": "Rule Out",
+    "H/O": "History Of",
+    "S/P": "Status Post",
+    
+    # ========== SPECIALTIES ==========
+    "ED": "Emergency Department",
+    "ER": "Emergency Room",
+    "ICU": "Intensive Care Unit",
+    "CCU": "Cardiac Care Unit",
+    "NICU": "Neonatal Intensive Care Unit",
+    "PICU": "Pediatric Intensive Care Unit",
+    "OR": "Operating Room",
+    "PACU": "Post-Anesthesia Care Unit",
+    "OB": "Obstetrics",
+    "GYN": "Gynecology",
+    "ENT": "Ear Nose Throat",
+    
+    # ========== OTHER COMMON ==========
+    "PRN": "As Needed",
+    "QD": "Once Daily",
+    "BID": "Twice Daily",
+    "TID": "Three Times Daily",
+    "QID": "Four Times Daily",
+    "HS": "At Bedtime",
+    "AC": "Before Meals",
+    "PC": "After Meals",
+    "NPO": "Nothing By Mouth",
+    "DNR": "Do Not Resuscitate",
+    "DNI": "Do Not Intubate",
+    "AMA": "Against Medical Advice",
+    "ADL": "Activities of Daily Living",
+    "ROM": "Range of Motion",
+    "PT": "Physical Therapy",
+    "OT": "Occupational Therapy",
+    "HPI": "History of Present Illness",
+    "PMH": "Past Medical History",
+    "PSH": "Past Surgical History",
+    "FH": "Family History",
+    "SH": "Social History",
 }
 
 def clean_description(description: str) -> str:

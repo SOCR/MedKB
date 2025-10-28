@@ -189,10 +189,31 @@ This will:
 ```
 
 **Full Production Run**:
-1. Open `run_pipeline.py`
-2. Change line 169: `TEST_MODE = False`
-3. Run: `python run_pipeline.py`
-4. Wait 30-60 minutes for full processing
+```bash
+python run_pipeline.py --full-run
+```
+- Processes entire document (~2000 chunks)
+- Saves checkpoint after each batch
+- Can be interrupted (Ctrl+C) and resumed later
+- Takes 30-60 minutes
+
+**Resume from Checkpoint** (if interrupted):
+```bash
+python run_pipeline.py --resume
+```
+- Continues from where you left off
+- Preserves progress if pipeline crashes
+
+**Custom Options**:
+```bash
+# Start from specific chunk
+python run_pipeline.py --start-chunk 500
+
+# Custom batch size (default: 5)
+python run_pipeline.py --full-run --batch-size 10
+```
+
+📖 **For complete checkpoint/resume documentation**: See `CHECKPOINT_GUIDE.md`
 
 ---
 

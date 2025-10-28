@@ -2,10 +2,18 @@
 """
 BioGraph Knowledge Graph Generation Pipeline - Main Execution Script
 Processes medical text documents and builds a Neo4j knowledge graph with enrichment.
+
+Supports checkpoint/resume functionality:
+  python run_pipeline.py                    # Start from beginning
+  python run_pipeline.py --resume           # Resume from last checkpoint
+  python run_pipeline.py --start-chunk 100  # Start from specific chunk
 """
 
 import os
 import sys
+import json
+import argparse
+from datetime import datetime
 from neo4j import GraphDatabase
 import boto3
 import psycopg2
@@ -32,12 +40,100 @@ from utils import (
     SOURCE_DOCUMENT_PATH
 )
 
+# =============================================================================
+# CHECKPOINT FUNCTIONALITY
+# =============================================================================
+CHECKPOINT_FILE = "pipeline_checkpoint.json"
+
+def save_checkpoint(chunk_index, total_chunks, nodes_loaded, relationships_loaded):
+    """Save pipeline progress to checkpoint file."""
+    checkpoint = {
+        "last_processed_chunk": chunk_index,
+        "total_chunks": total_chunks,
+        "total_nodes_loaded": nodes_loaded,
+        "total_relationships_loaded": relationships_loaded,
+        "timestamp": datetime.now().isoformat(),
+        "status": "in_progress"
+    }
+    with open(CHECKPOINT_FILE, 'w') as f:
+        json.dump(checkpoint, f, indent=2)
+    print(f"  💾 Checkpoint saved: chunk {chunk_index}/{total_chunks}")
+
+def load_checkpoint():
+    """Load checkpoint from file if it exists."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            checkpoint = json.load(f)
+        return checkpoint
+    return None
+
+def mark_checkpoint_complete(total_nodes, total_relationships):
+    """Mark pipeline as complete in checkpoint file."""
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, 'r') as f:
+            checkpoint = json.load(f)
+        checkpoint["status"] = "completed"
+        checkpoint["completion_time"] = datetime.now().isoformat()
+        checkpoint["final_nodes"] = total_nodes
+        checkpoint["final_relationships"] = total_relationships
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump(checkpoint, f, indent=2)
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='BioGraph Knowledge Graph Generation Pipeline',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run_pipeline.py                    # Start from beginning
+  python run_pipeline.py --resume           # Resume from last checkpoint
+  python run_pipeline.py --start-chunk 100  # Start from chunk 100
+  python run_pipeline.py --test-mode        # Process only 10 chunks (default)
+  python run_pipeline.py --full-run         # Process all chunks
+        """
+    )
+    parser.add_argument('--resume', action='store_true',
+                       help='Resume from last checkpoint')
+    parser.add_argument('--start-chunk', type=int, default=None,
+                       help='Start processing from specific chunk number (0-indexed)')
+    parser.add_argument('--test-mode', action='store_true', default=True,
+                       help='Process only first 10 chunks (default)')
+    parser.add_argument('--full-run', action='store_true',
+                       help='Process all chunks (override test mode)')
+    parser.add_argument('--batch-size', type=int, default=5,
+                       help='Number of chunks to process per batch (default: 5)')
+    return parser.parse_args()
+
 
 def main():
     """Main pipeline execution function."""
+    # Parse command line arguments
+    args = parse_arguments()
+    
     print("\n" + "="*60)
     print("🧬 BIOGRAPH KNOWLEDGE GRAPH GENERATION PIPELINE")
     print("="*60 + "\n")
+    
+    # Handle resume/checkpoint logic
+    start_chunk = 0
+    checkpoint = None
+    
+    if args.resume:
+        checkpoint = load_checkpoint()
+        if checkpoint:
+            start_chunk = checkpoint["last_processed_chunk"] + 1
+            print(f"📂 Resuming from checkpoint:")
+            print(f"   Last processed: Chunk {checkpoint['last_processed_chunk']}")
+            print(f"   Nodes loaded so far: {checkpoint['total_nodes_loaded']}")
+            print(f"   Relationships loaded so far: {checkpoint['total_relationships_loaded']}")
+            print(f"   Timestamp: {checkpoint['timestamp']}")
+            print(f"   Starting from chunk: {start_chunk}\n")
+        else:
+            print("⚠️  No checkpoint found. Starting from beginning.\n")
+    elif args.start_chunk is not None:
+        start_chunk = args.start_chunk
+        print(f"🎯 Starting from chunk {start_chunk} (user specified)\n")
     
     # ==========================================================================
     # STEP 1: Initialize All Services
@@ -78,8 +174,10 @@ def main():
         
         # 1e. Initialize Embedding Model
         print("  🔧 Loading embedding model (this may take a minute)...")
-        embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        print("  ✅ Embedding model loaded")
+        # Using all-mpnet-base-v2 for better quality (768d vs 384d)
+        # Change to 'all-MiniLM-L6-v2' if you need faster/lighter
+        embedding_model = SentenceTransformer('all-mpnet-base-v2')
+        print("  ✅ Embedding model loaded (all-mpnet-base-v2, 768 dimensions)")
         
         print("\n✅ All services initialized successfully!\n")
         
@@ -100,17 +198,19 @@ def main():
     print("-" * 60)
     
     try:
-        # Check if file exists
-        if not os.path.exists(SOURCE_DOCUMENT_PATH):
+        # Check if file exists at primary location
+        doc_path = SOURCE_DOCUMENT_PATH
+        if not os.path.exists(doc_path):
             # Try alternative path
             alt_path = os.path.join("data_corpus", "Biomedical_Knowledgebase.txt")
             if os.path.exists(alt_path):
-                SOURCE_DOCUMENT_PATH = alt_path
+                doc_path = alt_path
+                print(f"  📁 Using document from: {alt_path}")
             else:
-                raise FileNotFoundError(f"Source document not found at {SOURCE_DOCUMENT_PATH}")
+                raise FileNotFoundError(f"Source document not found at {SOURCE_DOCUMENT_PATH} or {alt_path}")
         
         # Load document
-        with open(SOURCE_DOCUMENT_PATH, 'r', encoding='utf-8') as f:
+        with open(doc_path, 'r', encoding='utf-8') as f:
             text = f.read()
         
         print(f"  📄 Loaded document: {len(text):,} characters")
@@ -125,7 +225,7 @@ def main():
         
     except FileNotFoundError as e:
         print(f"\n❌ FATAL: {e}")
-        print(f"   Please ensure the source document exists at: {SOURCE_DOCUMENT_PATH}")
+        print(f"   Please ensure the source document exists")
         sys.exit(1)
     except Exception as e:
         print(f"\n❌ FATAL: Error loading document: {e}")
@@ -136,40 +236,64 @@ def main():
     # ==========================================================================
     print("📋 STEP 3: Processing chunks and building knowledge graph...")
     print("-" * 60)
-    print(f"  ⚙️  Processing in batches of 5 chunks")
-    print(f"  📊 Total chunks to process: {len(text_nodes)}")
-    print()
     
-    # For initial testing, process only first 10 chunks
-    # Remove this limit once you verify everything works!
-    TEST_MODE = True
+    # Determine batch size and mode
+    batch_size = args.batch_size
+    print(f"  ⚙️  Processing in batches of {batch_size} chunks")
+    print(f"  📊 Total chunks in document: {len(text_nodes)}")
+    
+    # Test mode logic
+    TEST_MODE = args.test_mode and not args.full_run
+    original_chunk_count = len(text_nodes)
+    
     if TEST_MODE:
         print("  ⚠️  TEST MODE: Processing only first 10 chunks")
         text_nodes = text_nodes[:10]
         print(f"  📊 Test batch size: {len(text_nodes)} chunks")
-        print()
+    elif args.full_run:
+        print(f"  🚀 FULL RUN MODE: Processing all {len(text_nodes)} chunks")
     
-    batch_size = 5
+    # Skip to start_chunk if resuming
+    if start_chunk > 0:
+        if start_chunk >= len(text_nodes):
+            print(f"\n⚠️  Start chunk ({start_chunk}) >= total chunks ({len(text_nodes)})")
+            print("  Nothing to process!")
+            sys.exit(0)
+        print(f"  ⏩ Skipping to chunk {start_chunk}")
+        text_nodes = text_nodes[start_chunk:]
+        print(f"  📊 Remaining chunks to process: {len(text_nodes)}")
+    print()
+    
     num_batches = (len(text_nodes) + batch_size - 1) // batch_size
     
-    total_nodes_loaded = 0
-    total_relationships_loaded = 0
+    # Initialize totals (from checkpoint if resuming)
+    if checkpoint:
+        total_nodes_loaded = checkpoint["total_nodes_loaded"]
+        total_relationships_loaded = checkpoint["total_relationships_loaded"]
+    else:
+        total_nodes_loaded = 0
+        total_relationships_loaded = 0
     
     try:
         for batch_idx in range(num_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(text_nodes))
-            batch_nodes = text_nodes[start_idx:end_idx]
+            batch_start_idx = batch_idx * batch_size
+            batch_end_idx = min(batch_start_idx + batch_size, len(text_nodes))
+            batch_nodes = text_nodes[batch_start_idx:batch_end_idx]
             
-            print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {start_idx + 1}-{end_idx})")
+            # Calculate absolute chunk indices (accounting for start_chunk offset)
+            abs_start = start_chunk + batch_start_idx
+            abs_end = start_chunk + batch_end_idx
+            
+            print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {abs_start + 1}-{abs_end})")
             print("  " + "-" * 56)
             
             all_enriched_nodes = []
             all_enriched_relationships = []
             
             # Process each chunk in the batch
-            for chunk_idx, node in enumerate(batch_nodes, start=start_idx + 1):
-                print(f"\n    🔄 Processing chunk {chunk_idx}/{len(text_nodes)}...")
+            for local_idx, node in enumerate(batch_nodes):
+                abs_chunk_idx = start_chunk + batch_start_idx + local_idx
+                print(f"\n    🔄 Processing chunk {abs_chunk_idx + 1}/{original_chunk_count}...")
                 text_chunk = node.get_content()
                 
                 try:
@@ -210,6 +334,14 @@ def main():
                             total_relationships_loaded += len(all_enriched_relationships)
                     
                     print(f"  ✅ Batch {batch_idx + 1} loaded successfully!")
+                    
+                    # Save checkpoint after successful batch
+                    save_checkpoint(
+                        chunk_index=abs_end - 1,  # Last chunk in this batch
+                        total_chunks=original_chunk_count,
+                        nodes_loaded=total_nodes_loaded,
+                        relationships_loaded=total_relationships_loaded
+                    )
                     
                 except Exception as e:
                     print(f"  ❌ Error loading batch to Neo4j: {e}")
@@ -252,9 +384,19 @@ def main():
     print(f"  • Nodes loaded: {total_nodes_loaded}")
     print(f"  • Relationships loaded: {total_relationships_loaded}")
     
+    # Mark checkpoint as complete
+    if start_chunk + len(text_nodes) >= original_chunk_count or not TEST_MODE:
+        mark_checkpoint_complete(total_nodes_loaded, total_relationships_loaded)
+        print(f"\n✅ Pipeline marked as complete in checkpoint")
+    
     if TEST_MODE:
-        print(f"\n⚠️  TEST MODE was enabled - only {len(text_nodes)} chunks processed")
-        print(f"  To process full document, set TEST_MODE = False in run_pipeline.py")
+        print(f"\n⚠️  TEST MODE was enabled - only 10 chunks processed")
+        print(f"  To process full document, run: python run_pipeline.py --full-run")
+    
+    print(f"\n💡 Resume options:")
+    print(f"  • Resume from checkpoint: python run_pipeline.py --resume")
+    print(f"  • Start from specific chunk: python run_pipeline.py --start-chunk N")
+    print(f"  • Process all chunks: python run_pipeline.py --full-run")
     
     print(f"\n✅ Access your graph at: http://localhost:7474")
     print(f"   Username: neo4j")
