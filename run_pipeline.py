@@ -313,7 +313,7 @@ def main():
         TextColumn("•"),
         TextColumn("[cyan]{task.fields[speed]}"),
         TextColumn("•"),
-        TimeRemainingColumn(),
+        TextColumn("[magenta]ETA: {task.fields[eta]}"),
         TextColumn("•"),
         TextColumn("[green]Nodes: {task.fields[nodes]:,}"),
         TextColumn("•"),
@@ -329,6 +329,7 @@ def main():
                 "[bold cyan]Processing chunks...",
                 total=len(text_nodes),
                 speed="0.00 it/s",
+                eta="calculating...",
                 nodes=total_nodes_loaded,
                 rels=total_relationships_loaded
             )
@@ -375,17 +376,36 @@ def main():
                         chunk_time = time.time() - chunk_start_time
                         chunk_times.append(chunk_time)
                         
-                        # Update progress
-                        progress.update(task_id, advance=1)
-                        
-                        # Calculate speed
+                        # Calculate speed and ETA
                         elapsed = time.time() - pipeline_start_time
                         chunks_done = batch_start_idx + local_idx + 1
                         speed = chunks_done / elapsed if elapsed > 0 else 0
                         
+                        # Calculate ETA based on average chunk time
+                        remaining_chunks = len(text_nodes) - chunks_done
+                        avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
+                        eta_seconds = remaining_chunks * avg_time_per_chunk
+                        
+                        # Format ETA
+                        if eta_seconds > 0:
+                            eta_td = timedelta(seconds=int(eta_seconds))
+                            hours, remainder = divmod(eta_td.seconds, 3600)
+                            minutes, seconds = divmod(remainder, 60)
+                            if eta_td.days > 0:
+                                eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
+                            elif hours > 0:
+                                eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                            else:
+                                eta_str = f"{minutes:02d}m{seconds:02d}s"
+                        else:
+                            eta_str = "calculating..."
+                        
+                        # Update progress (single update with all fields)
                         progress.update(
                             task_id,
+                            advance=1,
                             speed=f"{speed:.2f} it/s",
+                            eta=eta_str,
                             nodes=total_nodes_loaded + len(all_enriched_nodes),
                             rels=total_relationships_loaded + len(all_enriched_relationships)
                         )
@@ -396,7 +416,29 @@ def main():
                     except Exception as e:
                         console.log(f"[yellow]⚠️  Error processing chunk {abs_chunk_idx + 1}: {e}[/yellow]")
                         console.log(f"[yellow]⏭️  Skipping to next chunk...[/yellow]")
-                        progress.update(task_id, advance=1)
+                        
+                        # Update progress even on error
+                        elapsed = time.time() - pipeline_start_time
+                        chunks_done = batch_start_idx + local_idx + 1
+                        speed = chunks_done / elapsed if elapsed > 0 else 0
+                        remaining_chunks = len(text_nodes) - chunks_done
+                        avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
+                        eta_seconds = remaining_chunks * avg_time_per_chunk
+                        
+                        if eta_seconds > 0:
+                            eta_td = timedelta(seconds=int(eta_seconds))
+                            hours, remainder = divmod(eta_td.seconds, 3600)
+                            minutes, seconds = divmod(remainder, 60)
+                            if eta_td.days > 0:
+                                eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
+                            elif hours > 0:
+                                eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                            else:
+                                eta_str = f"{minutes:02d}m{seconds:02d}s"
+                        else:
+                            eta_str = "calculating..."
+                        
+                        progress.update(task_id, advance=1, speed=f"{speed:.2f} it/s", eta=eta_str)
                         continue
                 
                 # Load batch to Neo4j
