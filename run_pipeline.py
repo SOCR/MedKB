@@ -13,13 +13,19 @@ import os
 import sys
 import json
 import argparse
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from neo4j import GraphDatabase
 import boto3
 import psycopg2
 from sentence_transformers import SentenceTransformer
 from llama_index.core import Document
 from llama_index.core.node_parser import SentenceSplitter
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn, MofNCompleteColumn
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
 
 # Import all functions from utils
 from utils import (
@@ -39,6 +45,22 @@ from utils import (
     AWS_REGION,
     SOURCE_DOCUMENT_PATH
 )
+
+# =============================================================================
+# RICH CONSOLE AND PROGRESS
+# =============================================================================
+console = Console()
+
+def format_time(seconds):
+    """Format seconds into human-readable time string."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.1f}m"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.2f}h"
 
 # =============================================================================
 # CHECKPOINT FUNCTIONALITY
@@ -274,87 +296,158 @@ def main():
         total_nodes_loaded = 0
         total_relationships_loaded = 0
     
+    # Start timing
+    pipeline_start_time = time.time()
+    chunk_times = []  # Track individual chunk processing times
+    
+    console.print(f"  ⏱️  Pipeline started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    # Create rich progress bar
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        TextColumn("•"),
+        TextColumn("[cyan]{task.fields[speed]}"),
+        TextColumn("•"),
+        TimeRemainingColumn(),
+        TextColumn("•"),
+        TextColumn("[green]Nodes: {task.fields[nodes]:,}"),
+        TextColumn("•"),
+        TextColumn("[yellow]Rels: {task.fields[rels]:,}"),
+        console=console,
+        expand=False
+    )
+    
     try:
-        for batch_idx in range(num_batches):
-            batch_start_idx = batch_idx * batch_size
-            batch_end_idx = min(batch_start_idx + batch_size, len(text_nodes))
-            batch_nodes = text_nodes[batch_start_idx:batch_end_idx]
+        with progress:
+            # Add overall progress task
+            task_id = progress.add_task(
+                "[bold cyan]Processing chunks...",
+                total=len(text_nodes),
+                speed="0.00 it/s",
+                nodes=total_nodes_loaded,
+                rels=total_relationships_loaded
+            )
             
-            # Calculate absolute chunk indices (accounting for start_chunk offset)
-            abs_start = start_chunk + batch_start_idx
-            abs_end = start_chunk + batch_end_idx
-            
-            print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {abs_start + 1}-{abs_end})")
-            print("  " + "-" * 56)
-            
-            all_enriched_nodes = []
-            all_enriched_relationships = []
-            
-            # Process each chunk in the batch
-            for local_idx, node in enumerate(batch_nodes):
-                abs_chunk_idx = start_chunk + batch_start_idx + local_idx
-                print(f"\n    🔄 Processing chunk {abs_chunk_idx + 1}/{original_chunk_count}...")
-                text_chunk = node.get_content()
+            for batch_idx in range(num_batches):
+                batch_start_idx = batch_idx * batch_size
+                batch_end_idx = min(batch_start_idx + batch_size, len(text_nodes))
+                batch_nodes = text_nodes[batch_start_idx:batch_end_idx]
                 
-                try:
-                    # Call the main enrichment pipeline
-                    enriched_data = process_text_chunk(
-                        text_chunk=text_chunk,
-                        llm=llm,
-                        aws_client=aws_client,
-                        umls_cursor=umls_cursor,
-                        embedding_model=embedding_model
-                    )
-                    
-                    all_enriched_nodes.extend(enriched_data['nodes'])
-                    all_enriched_relationships.extend(enriched_data['relationships'])
-                    
-                    print(f"    ✅ Extracted {len(enriched_data['nodes'])} nodes, "
-                          f"{len(enriched_data['relationships'])} relationships")
-                    
-                except Exception as e:
-                    print(f"    ⚠️  Error processing chunk {chunk_idx}: {e}")
-                    print(f"    ⏭️  Skipping to next chunk...")
-                    continue
-            
-            # Load batch to Neo4j
-            if all_enriched_nodes or all_enriched_relationships:
-                print(f"\n  💾 Loading batch to Neo4j...")
-                print(f"     Nodes: {len(all_enriched_nodes)}")
-                print(f"     Relationships: {len(all_enriched_relationships)}")
+                # Calculate absolute chunk indices (accounting for start_chunk offset)
+                abs_start = start_chunk + batch_start_idx
+                abs_end = start_chunk + batch_end_idx
                 
-                try:
-                    with neo4j_driver.session(database=NEO4J_DATABASE) as session:
-                        if all_enriched_nodes:
-                            session.execute_write(load_nodes_to_neo4j, all_enriched_nodes)
-                            total_nodes_loaded += len(all_enriched_nodes)
+                console.print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {abs_start + 1}-{abs_end})")
+                console.print("  " + "-" * 56)
+                
+                all_enriched_nodes = []
+                all_enriched_relationships = []
+                
+                # Process each chunk in the batch
+                batch_start_time = time.time()
+                
+                for local_idx, node in enumerate(batch_nodes):
+                    abs_chunk_idx = start_chunk + batch_start_idx + local_idx
+                    chunk_start_time = time.time()
+                    
+                    console.log(f"🔄 Processing chunk {abs_chunk_idx + 1}/{original_chunk_count}...")
+                    text_chunk = node.get_content()
+                    
+                    try:
+                        # Call the main enrichment pipeline
+                        enriched_data = process_text_chunk(
+                            text_chunk=text_chunk,
+                            llm=llm,
+                            aws_client=aws_client,
+                            umls_cursor=umls_cursor,
+                            embedding_model=embedding_model
+                        )
                         
-                        if all_enriched_relationships:
-                            session.execute_write(load_relationships_to_neo4j, all_enriched_relationships)
-                            total_relationships_loaded += len(all_enriched_relationships)
+                        all_enriched_nodes.extend(enriched_data['nodes'])
+                        all_enriched_relationships.extend(enriched_data['relationships'])
+                        
+                        # Track chunk time
+                        chunk_time = time.time() - chunk_start_time
+                        chunk_times.append(chunk_time)
+                        
+                        # Update progress
+                        progress.update(task_id, advance=1)
+                        
+                        # Calculate speed
+                        elapsed = time.time() - pipeline_start_time
+                        chunks_done = batch_start_idx + local_idx + 1
+                        speed = chunks_done / elapsed if elapsed > 0 else 0
+                        
+                        progress.update(
+                            task_id,
+                            speed=f"{speed:.2f} it/s",
+                            nodes=total_nodes_loaded + len(all_enriched_nodes),
+                            rels=total_relationships_loaded + len(all_enriched_relationships)
+                        )
+                        
+                        console.log(f"✅ Extracted {len(enriched_data['nodes'])} nodes, "
+                                  f"{len(enriched_data['relationships'])} rels (⏱️  {chunk_time:.2f}s)")
+                        
+                    except Exception as e:
+                        console.log(f"[yellow]⚠️  Error processing chunk {abs_chunk_idx + 1}: {e}[/yellow]")
+                        console.log(f"[yellow]⏭️  Skipping to next chunk...[/yellow]")
+                        progress.update(task_id, advance=1)
+                        continue
+                
+                # Load batch to Neo4j
+                if all_enriched_nodes or all_enriched_relationships:
+                    console.log(f"💾 Loading batch to Neo4j... (Nodes: {len(all_enriched_nodes)}, Rels: {len(all_enriched_relationships)})")
                     
-                    print(f"  ✅ Batch {batch_idx + 1} loaded successfully!")
-                    
-                    # Save checkpoint after successful batch
-                    save_checkpoint(
-                        chunk_index=abs_end - 1,  # Last chunk in this batch
-                        total_chunks=original_chunk_count,
-                        nodes_loaded=total_nodes_loaded,
-                        relationships_loaded=total_relationships_loaded
-                    )
-                    
-                except Exception as e:
-                    print(f"  ❌ Error loading batch to Neo4j: {e}")
-                    print(f"  ⚠️  Continuing with next batch...")
-                    continue
-            else:
-                print(f"  ⚠️  No data extracted from batch {batch_idx + 1}")
+                    try:
+                        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                            if all_enriched_nodes:
+                                session.execute_write(load_nodes_to_neo4j, all_enriched_nodes)
+                                total_nodes_loaded += len(all_enriched_nodes)
+                            
+                            if all_enriched_relationships:
+                                session.execute_write(load_relationships_to_neo4j, all_enriched_relationships)
+                                total_relationships_loaded += len(all_enriched_relationships)
+                        
+                        # Update final counts in progress
+                        progress.update(
+                            task_id,
+                            nodes=total_nodes_loaded,
+                            rels=total_relationships_loaded
+                        )
+                        
+                        console.log(f"[green]✅ Batch {batch_idx + 1} loaded successfully![/green]")
+                        
+                        # Save checkpoint after successful batch
+                        save_checkpoint(
+                            chunk_index=abs_end - 1,  # Last chunk in this batch
+                            total_chunks=original_chunk_count,
+                            nodes_loaded=total_nodes_loaded,
+                            relationships_loaded=total_relationships_loaded
+                        )
+                        console.log(f"💾 Checkpoint saved")
+                        
+                    except Exception as e:
+                        console.log(f"[red]❌ Error loading batch to Neo4j: {e}[/red]")
+                        console.log(f"[yellow]⚠️  Continuing with next batch...[/yellow]")
+                        continue
+                else:
+                    console.log(f"[yellow]⚠️  No data extracted from batch {batch_idx + 1}[/yellow]")
     
     except KeyboardInterrupt:
-        print("\n\n⚠️  Pipeline interrupted by user")
-        print("  Partial data may have been loaded to Neo4j")
+        print("\n\n⚠️  Pipeline interrupted by user (Ctrl+C)")
+        elapsed = time.time() - pipeline_start_time
+        print(f"  ⏱️  Time elapsed before interrupt: {format_time(elapsed)}")
+        print(f"  📦 Partial data loaded: {total_nodes_loaded:,} nodes, {total_relationships_loaded:,} relationships")
+        print(f"  💾 Last checkpoint saved - you can resume with: python run_pipeline.py --resume")
     except Exception as e:
         print(f"\n❌ Unexpected error during processing: {e}")
+        elapsed = time.time() - pipeline_start_time
+        print(f"  ⏱️  Time elapsed before error: {format_time(elapsed)}")
         import traceback
         traceback.print_exc()
     
@@ -375,14 +468,39 @@ def main():
         neo4j_driver.close()
         print("  ✅ Neo4j connection closed")
     
+    # Calculate final timing statistics
+    total_elapsed = time.time() - pipeline_start_time
+    
     # Print summary
     print("\n" + "="*60)
     print("🎉 PIPELINE COMPLETED!")
     print("="*60)
-    print(f"\n📊 Summary:")
+    
+    print(f"\n📊 Processing Summary:")
     print(f"  • Total chunks processed: {len(text_nodes)}")
-    print(f"  • Nodes loaded: {total_nodes_loaded}")
-    print(f"  • Relationships loaded: {total_relationships_loaded}")
+    print(f"  • Nodes loaded: {total_nodes_loaded:,}")
+    print(f"  • Relationships loaded: {total_relationships_loaded:,}")
+    
+    print(f"\n⏱️  Timing Statistics:")
+    print(f"  • Total time: {format_time(total_elapsed)}")
+    print(f"  • Start: {datetime.fromtimestamp(pipeline_start_time).strftime('%H:%M:%S')}")
+    print(f"  • End: {datetime.now().strftime('%H:%M:%S')}")
+    
+    if chunk_times:
+        avg_chunk_time = sum(chunk_times) / len(chunk_times)
+        min_chunk_time = min(chunk_times)
+        max_chunk_time = max(chunk_times)
+        chunks_per_sec = len(chunk_times) / total_elapsed if total_elapsed > 0 else 0
+        
+        print(f"  • Average time/chunk: {avg_chunk_time:.2f}s")
+        print(f"  • Min time/chunk: {min_chunk_time:.2f}s")
+        print(f"  • Max time/chunk: {max_chunk_time:.2f}s")
+        print(f"  • Processing speed: {chunks_per_sec:.3f} chunks/s ({chunks_per_sec*60:.1f} chunks/min)")
+        
+        if total_nodes_loaded > 0:
+            nodes_per_sec = total_nodes_loaded / total_elapsed
+            rels_per_sec = total_relationships_loaded / total_elapsed
+            print(f"  • Throughput: {nodes_per_sec:.1f} nodes/s, {rels_per_sec:.1f} rels/s")
     
     # Mark checkpoint as complete
     if start_chunk + len(text_nodes) >= original_chunk_count or not TEST_MODE:
