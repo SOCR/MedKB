@@ -75,7 +75,25 @@ def ensure_output_directory():
 
 def save_batch_json(batch_number, chunk_range, nodes, relationships, processing_time):
     """Save batch data to JSON file."""
+    import numpy as np
+    
     batch_file = OUTPUT_DIR / f"batch_{batch_number:04d}.json"
+    
+    # Convert numpy arrays to lists for JSON serialization
+    def convert_numpy(obj):
+        """Recursively convert numpy arrays to lists."""
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert_numpy(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_numpy(item) for item in obj]
+        else:
+            return obj
+    
+    # Convert nodes and relationships
+    serializable_nodes = convert_numpy(nodes)
+    serializable_relationships = convert_numpy(relationships)
     
     batch_data = {
         "batch_number": batch_number,
@@ -85,8 +103,8 @@ def save_batch_json(batch_number, chunk_range, nodes, relationships, processing_
         },
         "timestamp": datetime.now().isoformat(),
         "processing_time_seconds": round(processing_time, 2),
-        "nodes": nodes,
-        "relationships": relationships,
+        "nodes": serializable_nodes,
+        "relationships": serializable_relationships,
         "stats": {
             "nodes_count": len(nodes),
             "relationships_count": len(relationships)
@@ -551,14 +569,18 @@ def main():
                         console.log(f"💾 Checkpoint saved")
                         
                         # Save batch data to JSON
-                        batch_file = save_batch_json(
-                            batch_number=batch_idx + 1,
-                            chunk_range=(abs_start, abs_end - 1),
-                            nodes=all_enriched_nodes,
-                            relationships=all_enriched_relationships,
-                            processing_time=batch_processing_time
-                        )
-                        console.log(f"[cyan]📄 JSON saved: {batch_file.name}[/cyan]")
+                        try:
+                            batch_file = save_batch_json(
+                                batch_number=batch_idx + 1,
+                                chunk_range=(abs_start, abs_end - 1),
+                                nodes=all_enriched_nodes,
+                                relationships=all_enriched_relationships,
+                                processing_time=batch_processing_time
+                            )
+                            console.log(f"[cyan]📄 JSON saved: {batch_file.name}[/cyan]")
+                        except Exception as json_error:
+                            console.log(f"[yellow]⚠️  JSON save failed: {json_error}[/yellow]")
+                            console.log(f"[yellow]   Data is in Neo4j, JSON backup not created for this batch[/yellow]")
                         
                     except Exception as e:
                         console.log(f"[red]❌ Error loading batch to Neo4j: {e}[/red]")
