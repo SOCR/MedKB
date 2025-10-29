@@ -222,23 +222,35 @@ def save_pipeline_metadata(total_batches, total_chunks, total_nodes, total_rels,
     return metadata_file
 
 # =============================================================================
-# CHECKPOINT FUNCTIONALITY
+# CHECKPOINT FUNCTIONALITY (Multi-Document Support)
 # =============================================================================
 CHECKPOINT_FILE = "pipeline_checkpoint.json"
 
-def save_checkpoint(chunk_index, total_chunks, nodes_loaded, relationships_loaded):
-    """Save pipeline progress to checkpoint file."""
+def save_checkpoint(doc_index, doc_id, total_docs, chunk_index, total_chunks_in_doc, 
+                   completed_docs, nodes_loaded, relationships_loaded):
+    """Save pipeline progress with document-level tracking."""
     checkpoint = {
+        # Document-level tracking
+        "current_document_index": doc_index,
+        "current_document_id": doc_id,
+        "total_documents": total_docs,
+        "completed_documents": completed_docs,
+        "documents_processed": len(completed_docs),
+        
+        # Chunk-level tracking (within current document)
         "last_processed_chunk": chunk_index,
-        "total_chunks": total_chunks,
+        "total_chunks_in_document": total_chunks_in_doc,
+        
+        # Global stats
         "total_nodes_loaded": nodes_loaded,
         "total_relationships_loaded": relationships_loaded,
+        
+        # Timestamps
         "timestamp": datetime.now().isoformat(),
         "status": "in_progress"
     }
     with open(CHECKPOINT_FILE, 'w') as f:
         json.dump(checkpoint, f, indent=2)
-    print(f"  💾 Checkpoint saved: chunk {chunk_index}/{total_chunks}")
 
 def load_checkpoint():
     """Load checkpoint from file if it exists."""
@@ -248,13 +260,14 @@ def load_checkpoint():
         return checkpoint
     return None
 
-def mark_checkpoint_complete(total_nodes, total_relationships):
+def mark_checkpoint_complete(total_docs, total_nodes, total_relationships):
     """Mark pipeline as complete in checkpoint file."""
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, 'r') as f:
             checkpoint = json.load(f)
         checkpoint["status"] = "completed"
         checkpoint["completion_time"] = datetime.now().isoformat()
+        checkpoint["total_documents_processed"] = total_docs
         checkpoint["final_nodes"] = total_nodes
         checkpoint["final_relationships"] = total_relationships
         with open(CHECKPOINT_FILE, 'w') as f:
@@ -301,19 +314,25 @@ def main():
     print("="*60 + "\n")
     
     # Handle resume/checkpoint logic
-    start_chunk = 0
     checkpoint = None
+    start_doc_index = 0
+    start_chunk = 0
+    completed_documents = []
     
     if args.resume:
         checkpoint = load_checkpoint()
         if checkpoint:
-            start_chunk = checkpoint["last_processed_chunk"] + 1
+            start_doc_index = checkpoint.get("current_document_index", 0)
+            start_chunk = checkpoint.get("last_processed_chunk", 0) + 1
+            completed_documents = checkpoint.get("completed_documents", [])
             print(f"📂 Resuming from checkpoint:")
-            print(f"   Last processed: Chunk {checkpoint['last_processed_chunk']}")
+            print(f"   Document {start_doc_index + 1} ({checkpoint.get('current_document_id', 'unknown')})")
+            print(f"   Last processed: Chunk {checkpoint.get('last_processed_chunk', 0)}")
+            print(f"   Documents completed: {len(completed_documents)}")
             print(f"   Nodes loaded so far: {checkpoint['total_nodes_loaded']}")
             print(f"   Relationships loaded so far: {checkpoint['total_relationships_loaded']}")
             print(f"   Timestamp: {checkpoint['timestamp']}")
-            print(f"   Starting from chunk: {start_chunk}\n")
+            print(f"   Resuming from chunk: {start_chunk}\n")
         else:
             print("⚠️  No checkpoint found. Starting from beginning.\n")
     elif args.start_chunk is not None:
@@ -381,112 +400,68 @@ def main():
         sys.exit(1)
     
     # ==========================================================================
-    # STEP 2: Load and Chunk Source Document
+    # STEP 2: Get List of Documents to Process
     # ==========================================================================
-    print("📋 STEP 2: Loading source document and extracting metadata...")
+    print("📋 STEP 2: Determining documents to process...")
     print("-" * 60)
     
     try:
-        # Determine which document to process
+        # Get list of documents
         if args.single_document:
-            doc_path = Path(args.single_document)
-            if not doc_path.exists():
+            document_paths = [Path(args.single_document)]
+            if not document_paths[0].exists():
                 raise FileNotFoundError(f"Specified document not found: {args.single_document}")
+            console.print(f"  📄 Single document mode: {document_paths[0].name}")
         else:
-            # Use default document
-            doc_path = Path(SOURCE_DOCUMENT_PATH)
-            if not doc_path.exists():
-                # Try alternative path
-                alt_path = Path("data_corpus") / "Biomedical_Knowledgebase.txt"
-                if alt_path.exists():
-                    doc_path = alt_path
-                    console.print(f"  📁 Using document from: {alt_path}")
-                else:
-                    raise FileNotFoundError(f"Source document not found at {SOURCE_DOCUMENT_PATH} or {alt_path}")
+            # Check if data directory exists and has files
+            document_paths = get_document_list(args.data_directory)
+            if not document_paths:
+                console.print(f"  ⚠️  No .txt files found in {args.data_directory}")
+                console.print(f"  Trying default document...")
+                doc_path = Path(SOURCE_DOCUMENT_PATH)
+                if not doc_path.exists():
+                    alt_path = Path("data_corpus") / "Biomedical_Knowledgebase.txt"
+                    if alt_path.exists():
+                        doc_path = alt_path
+                    else:
+                        raise FileNotFoundError(f"No documents found")
+                document_paths = [doc_path]
         
-        console.print(f"  📄 Document: {doc_path.name}")
+        console.print(f"  📚 Found {len(document_paths)} document(s) to process")
         
-        # Generate source ID for this document
-        source_id = generate_source_id(doc_path)
-        console.print(f"  🆔 Source ID: {source_id}")
-        
-        # Extract document context (species + metadata) from first 75 lines
-        console.print("  🔍 Extracting document metadata and species...")
-        document_context = extract_document_context(
-            file_path=str(doc_path),
-            source_id=source_id,
-            llm=llm
-        )
-        
-        console.print(f"  ├─ Title: {document_context['title'][:80]}{'...' if len(document_context['title']) > 80 else ''}")
-        console.print(f"  ├─ Journal: {document_context['journal']}")
-        console.print(f"  ├─ Year: {document_context['publication_year']}")
-        console.print(f"  ├─ Species: {document_context['primary_species']} (confidence: {document_context['species_confidence']})")
-        console.print(f"  └─ Study Type: {document_context['study_type']}\n")
-        
-        # Create Source node in Neo4j
-        console.print("  💾 Creating Source node in Neo4j...")
-        create_source_node(neo4j_driver, document_context)
-        console.print("  ✅ Source node created\n")
-        
-        # Load document text (skip first 75 lines already processed for context)
-        text = load_document_skip_header(doc_path, skip_lines=75)
-        console.print(f"  📄 Loaded document: {len(text):,} characters (header skipped)")
-        
-        # Split into chunks
-        documents = [Document(text=text)]
-        splitter = SentenceSplitter(chunk_size=512, chunk_overlap=20)
-        text_nodes = splitter.get_nodes_from_documents(documents)
-        
-        console.print(f"  ✂️  Split into {len(text_nodes):,} chunks")
-        console.print(f"  ✅ Ready for processing\n")
+        # Filter out completed documents if resuming
+        if completed_documents:
+            console.print(f"  ✓ {len(completed_documents)} document(s) already completed")
+            remaining = []
+            for doc_path in document_paths:
+                source_id = generate_source_id(doc_path)
+                if source_id not in completed_documents:
+                    remaining.append(doc_path)
+            console.print(f"  → {len(remaining)} document(s) remaining")
+            
+        console.print()
         
     except FileNotFoundError as e:
         console.print(f"\n❌ FATAL: {e}")
-        console.print(f"   Please ensure the source document exists")
+        console.print(f"   Please ensure documents exist in the specified location")
         sys.exit(1)
     except Exception as e:
-        console.print(f"\n❌ FATAL: Error loading document: {e}")
+        console.print(f"\n❌ FATAL: Error scanning documents: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
     
     # ==========================================================================
-    # STEP 3: Process Chunks and Build Knowledge Graph
+    # STEP 3: Process Each Document
     # ==========================================================================
-    print("📋 STEP 3: Processing chunks and building knowledge graph...")
+    print("📋 STEP 3: Processing documents and building knowledge graph...")
     print("-" * 60)
     
-    # Determine batch size and mode
+    # Batch size configuration
     batch_size = args.batch_size
-    print(f"  ⚙️  Processing in batches of {batch_size} chunks")
-    print(f"  📊 Total chunks in document: {len(text_nodes)}")
-    
-    # Test mode logic
     TEST_MODE = args.test_mode and not args.full_run
-    original_chunk_count = len(text_nodes)
     
-    if TEST_MODE:
-        print("  ⚠️  TEST MODE: Processing only first 10 chunks")
-        text_nodes = text_nodes[:10]
-        print(f"  📊 Test batch size: {len(text_nodes)} chunks")
-    elif args.full_run:
-        print(f"  🚀 FULL RUN MODE: Processing all {len(text_nodes)} chunks")
-    
-    # Skip to start_chunk if resuming
-    if start_chunk > 0:
-        if start_chunk >= len(text_nodes):
-            print(f"\n⚠️  Start chunk ({start_chunk}) >= total chunks ({len(text_nodes)})")
-            print("  Nothing to process!")
-            sys.exit(0)
-        print(f"  ⏩ Skipping to chunk {start_chunk}")
-        text_nodes = text_nodes[start_chunk:]
-        print(f"  📊 Remaining chunks to process: {len(text_nodes)}")
-    print()
-    
-    num_batches = (len(text_nodes) + batch_size - 1) // batch_size
-    
-    # Initialize totals (from checkpoint if resuming)
+    # Initialize global totals (from checkpoint if resuming)
     if checkpoint:
         total_nodes_loaded = checkpoint["total_nodes_loaded"]
         total_relationships_loaded = checkpoint["total_relationships_loaded"]
@@ -494,207 +469,294 @@ def main():
         total_nodes_loaded = 0
         total_relationships_loaded = 0
     
-    # Start timing
+    # Start global timing
     pipeline_start_time = time.time()
-    chunk_times = []  # Track individual chunk processing times
     
-    console.print(f"  ⏱️  Pipeline started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    console.print(f"  ⏱️  Pipeline started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    console.print(f"  📚 Total documents to process: {len(document_paths)}")
+    console.print(f"  ⚙️  Batch size: {batch_size} chunks per batch\n")
     
-    # Create rich progress bar
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=40),
-        MofNCompleteColumn(),
-        TextColumn("•"),
-        TimeElapsedColumn(),
-        TextColumn("•"),
-        TextColumn("[cyan]{task.fields[speed]}"),
-        TextColumn("•"),
-        TextColumn("[magenta]ETA: {task.fields[eta]}"),
-        TextColumn("•"),
-        TextColumn("[green]Nodes: {task.fields[nodes]:,}"),
-        TextColumn("•"),
-        TextColumn("[yellow]Rels: {task.fields[rels]:,}"),
-        console=console,
-        expand=False
-    )
-    
+    # ==========================================================================
+    # DOCUMENT LOOP: Process each document
+    # ==========================================================================
     try:
-        with progress:
-            # Add overall progress task
-            task_id = progress.add_task(
-                "[bold cyan]Processing chunks...",
-                total=len(text_nodes),
-                speed="0.00 it/s",
-                eta="calculating...",
-                nodes=total_nodes_loaded,
-                rels=total_relationships_loaded
-            )
+        for doc_idx in range(start_doc_index, len(document_paths)):
+            doc_path = document_paths[doc_idx]
+            source_id = generate_source_id(doc_path)
             
-            for batch_idx in range(num_batches):
-                batch_start_idx = batch_idx * batch_size
-                batch_end_idx = min(batch_start_idx + batch_size, len(text_nodes))
-                batch_nodes = text_nodes[batch_start_idx:batch_end_idx]
+            # Skip if already completed
+            if source_id in completed_documents:
+                console.print(f"✓ Skipping {source_id} (already completed)\n")
+                continue
+            
+            console.print(f"\n{'='*60}")
+            console.print(f"📄 Document {doc_idx + 1}/{len(document_paths)}: {doc_path.name}")
+            console.print(f"{'='*60}\n")
+            
+            try:
+                # Extract document context (species + metadata) from first 75 lines
+                console.print(f"  🔍 Extracting document metadata and species...")
+                document_context = extract_document_context(
+                    file_path=str(doc_path),
+                    source_id=source_id,
+                    llm=llm
+                )
+            
+                console.print(f"  ├─ Title: {document_context['title'][:70]}{'...' if len(document_context['title']) > 70 else ''}")
+                console.print(f"  ├─ Journal: {document_context['journal']}")
+                console.print(f"  ├─ Species: {document_context['primary_species']} ({document_context['species_confidence']})")
+                console.print(f"  └─ Study Type: {document_context['study_type']}\n")
                 
-                # Calculate absolute chunk indices (accounting for start_chunk offset)
-                abs_start = start_chunk + batch_start_idx
-                abs_end = start_chunk + batch_end_idx
+                # Create Source node in Neo4j
+                create_source_node(neo4j_driver, document_context)
                 
-                console.print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {abs_start + 1}-{abs_end})")
-                console.print("  " + "-" * 56)
+                # Load document text (skip first 75 lines already processed for context)
+                text = load_document_skip_header(doc_path, skip_lines=75)
+                console.print(f"  📄 Loaded: {len(text):,} characters (header skipped)")
                 
-                all_enriched_nodes = []
-                all_enriched_relationships = []
+                # Split into chunks
+                documents = [Document(text=text)]
+                splitter = SentenceSplitter(chunk_size=512, chunk_overlap=20)
+                text_nodes = splitter.get_nodes_from_documents(documents)
                 
-                # Process each chunk in the batch
-                batch_start_time = time.time()
-                
-                for local_idx, node in enumerate(batch_nodes):
-                    abs_chunk_idx = start_chunk + batch_start_idx + local_idx
-                    chunk_start_time = time.time()
+                console.print(f"  ✂️  Split into {len(text_nodes):,} chunks\n")
+            
+            except Exception as e:
+                console.print(f"[red]❌ Error loading document {source_id}: {e}[/red]")
+                console.print(f"[yellow]⏭️  Skipping to next document...[/yellow]\n")
+                continue
+        
+            # Test mode logic (per document)
+            original_chunk_count = len(text_nodes)
+            if TEST_MODE:
+                console.print(f"  ⚠️  TEST MODE: Processing only first 10 chunks of this document")
+                text_nodes = text_nodes[:10]
+            
+            # Skip to start_chunk if resuming this specific document
+            doc_start_chunk = start_chunk if doc_idx == start_doc_index else 0
+            if doc_start_chunk > 0:
+                if doc_start_chunk >= len(text_nodes):
+                    console.print(f"  ⚠️  Start chunk ({doc_start_chunk}) >= total chunks ({len(text_nodes)})")
+                    console.print(f"  Marking document as complete and moving to next...\n")
+                    completed_documents.append(source_id)
+                    continue
+                console.print(f"  ⏩ Resuming from chunk {doc_start_chunk}")
+                text_nodes = text_nodes[doc_start_chunk:]
+            
+            num_batches = (len(text_nodes) + batch_size - 1) // batch_size
+            console.print(f"  📊 Processing {len(text_nodes)} chunks in {num_batches} batch(es)\n")
+            
+            chunk_times = []  # Track chunk times for this document
+            
+            # Create rich progress bar for this document
+            progress = Progress(
+                SpinnerColumn(),
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(bar_width=40),
+                MofNCompleteColumn(),
+                TextColumn("•"),
+                TimeElapsedColumn(),
+                TextColumn("•"),
+                TextColumn("[cyan]{task.fields[speed]}"),
+                TextColumn("•"),
+                TextColumn("[magenta]ETA: {task.fields[eta]}"),
+                TextColumn("•"),
+                TextColumn("[green]Nodes: {task.fields[nodes]:,}"),
+                TextColumn("•"),
+                TextColumn("[yellow]Rels: {task.fields[rels]:,}"),
+                console=console,
+                expand=False
+            )
+        
+            try:
+                with progress:
+                    # Add overall progress task
+                    task_id = progress.add_task(
+                        "[bold cyan]Processing chunks...",
+                        total=len(text_nodes),
+                        speed="0.00 it/s",
+                        eta="calculating...",
+                        nodes=total_nodes_loaded,
+                        rels=total_relationships_loaded
+                    )
                     
-                    console.log(f"🔄 Processing chunk {abs_chunk_idx + 1}/{original_chunk_count}...")
-                    text_chunk = node.get_content()
-                    
-                    try:
-                        # Call the main enrichment pipeline with document context
-                        enriched_data = process_text_chunk(
-                            text_chunk=text_chunk,
-                            document_context=document_context,
-                            llm=llm,
-                            aws_client=aws_client,
-                            umls_cursor=umls_cursor,
-                            embedding_model=embedding_model
-                        )
+                    for batch_idx in range(num_batches):
+                        batch_start_idx = batch_idx * batch_size
+                        batch_end_idx = min(batch_start_idx + batch_size, len(text_nodes))
+                        batch_nodes = text_nodes[batch_start_idx:batch_end_idx]
                         
-                        all_enriched_nodes.extend(enriched_data['nodes'])
-                        all_enriched_relationships.extend(enriched_data['relationships'])
+                        # Calculate absolute chunk indices (accounting for start_chunk offset)
+                        abs_start = start_chunk + batch_start_idx
+                        abs_end = start_chunk + batch_end_idx
                         
-                        # Track chunk time
-                        chunk_time = time.time() - chunk_start_time
-                        chunk_times.append(chunk_time)
+                        console.print(f"\n  📦 Batch {batch_idx + 1}/{num_batches} (chunks {abs_start + 1}-{abs_end})")
+                        console.print("  " + "-" * 56)
                         
-                        # Calculate speed and ETA
-                        elapsed = time.time() - pipeline_start_time
-                        chunks_done = batch_start_idx + local_idx + 1
-                        speed = chunks_done / elapsed if elapsed > 0 else 0
+                        all_enriched_nodes = []
+                        all_enriched_relationships = []
                         
-                        # Calculate ETA based on average chunk time
-                        remaining_chunks = len(text_nodes) - chunks_done
-                        avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
-                        eta_seconds = remaining_chunks * avg_time_per_chunk
+                        # Process each chunk in the batch
+                        batch_start_time = time.time()
                         
-                        # Format ETA
-                        if eta_seconds > 0:
-                            eta_td = timedelta(seconds=int(eta_seconds))
-                            hours, remainder = divmod(eta_td.seconds, 3600)
-                            minutes, seconds = divmod(remainder, 60)
-                            if eta_td.days > 0:
-                                eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
-                            elif hours > 0:
-                                eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
-                            else:
-                                eta_str = f"{minutes:02d}m{seconds:02d}s"
-                        else:
-                            eta_str = "calculating..."
-                        
-                        # Update progress (single update with all fields)
-                        progress.update(
-                            task_id,
-                            advance=1,
-                            speed=f"{speed:.2f} it/s",
-                            eta=eta_str,
-                            nodes=total_nodes_loaded + len(all_enriched_nodes),
-                            rels=total_relationships_loaded + len(all_enriched_relationships)
-                        )
-                        
-                        console.log(f"✅ Extracted {len(enriched_data['nodes'])} nodes, "
-                                  f"{len(enriched_data['relationships'])} rels (⏱️  {chunk_time:.2f}s)")
-                        
-                    except Exception as e:
-                        console.log(f"[yellow]⚠️  Error processing chunk {abs_chunk_idx + 1}: {e}[/yellow]")
-                        console.log(f"[yellow]⏭️  Skipping to next chunk...[/yellow]")
-                        
-                        # Update progress even on error
-                        elapsed = time.time() - pipeline_start_time
-                        chunks_done = batch_start_idx + local_idx + 1
-                        speed = chunks_done / elapsed if elapsed > 0 else 0
-                        remaining_chunks = len(text_nodes) - chunks_done
-                        avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
-                        eta_seconds = remaining_chunks * avg_time_per_chunk
-                        
-                        if eta_seconds > 0:
-                            eta_td = timedelta(seconds=int(eta_seconds))
-                            hours, remainder = divmod(eta_td.seconds, 3600)
-                            minutes, seconds = divmod(remainder, 60)
-                            if eta_td.days > 0:
-                                eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
-                            elif hours > 0:
-                                eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
-                            else:
-                                eta_str = f"{minutes:02d}m{seconds:02d}s"
-                        else:
-                            eta_str = "calculating..."
-                        
-                        progress.update(task_id, advance=1, speed=f"{speed:.2f} it/s", eta=eta_str)
-                        continue
-                
-                # Load batch to Neo4j
-                if all_enriched_nodes or all_enriched_relationships:
-                    console.log(f"💾 Loading batch to Neo4j... (Nodes: {len(all_enriched_nodes)}, Rels: {len(all_enriched_relationships)})")
-                    
-                    try:
-                        with neo4j_driver.session(database=NEO4J_DATABASE) as session:
-                            if all_enriched_nodes:
-                                session.execute_write(load_nodes_to_neo4j, all_enriched_nodes)
-                                total_nodes_loaded += len(all_enriched_nodes)
+                        for local_idx, node in enumerate(batch_nodes):
+                            abs_chunk_idx = start_chunk + batch_start_idx + local_idx
+                            chunk_start_time = time.time()
                             
-                            if all_enriched_relationships:
-                                session.execute_write(load_relationships_to_neo4j, all_enriched_relationships)
-                                total_relationships_loaded += len(all_enriched_relationships)
+                            console.log(f"🔄 Processing chunk {abs_chunk_idx + 1}/{original_chunk_count}...")
+                            text_chunk = node.get_content()
+                            
+                            try:
+                                # Call the main enrichment pipeline with document context
+                                enriched_data = process_text_chunk(
+                                    text_chunk=text_chunk,
+                                    document_context=document_context,
+                                    llm=llm,
+                                    aws_client=aws_client,
+                                    umls_cursor=umls_cursor,
+                                    embedding_model=embedding_model
+                                )
+                            
+                                all_enriched_nodes.extend(enriched_data['nodes'])
+                                all_enriched_relationships.extend(enriched_data['relationships'])
+                                
+                                # Track chunk time
+                                chunk_time = time.time() - chunk_start_time
+                                chunk_times.append(chunk_time)
+                                
+                                # Calculate speed and ETA
+                                elapsed = time.time() - pipeline_start_time
+                                chunks_done = batch_start_idx + local_idx + 1
+                                speed = chunks_done / elapsed if elapsed > 0 else 0
+                                
+                                # Calculate ETA based on average chunk time
+                                remaining_chunks = len(text_nodes) - chunks_done
+                                avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
+                                eta_seconds = remaining_chunks * avg_time_per_chunk
+                                
+                                # Format ETA
+                                if eta_seconds > 0:
+                                    eta_td = timedelta(seconds=int(eta_seconds))
+                                    hours, remainder = divmod(eta_td.seconds, 3600)
+                                    minutes, seconds = divmod(remainder, 60)
+                                    if eta_td.days > 0:
+                                        eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
+                                    elif hours > 0:
+                                        eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                                    else:
+                                        eta_str = f"{minutes:02d}m{seconds:02d}s"
+                                else:
+                                    eta_str = "calculating..."
+                                
+                                # Update progress (single update with all fields)
+                                progress.update(
+                                    task_id,
+                                    advance=1,
+                                    speed=f"{speed:.2f} it/s",
+                                    eta=eta_str,
+                                    nodes=total_nodes_loaded + len(all_enriched_nodes),
+                                    rels=total_relationships_loaded + len(all_enriched_relationships)
+                                )
+                                
+                                console.log(f"✅ Extracted {len(enriched_data['nodes'])} nodes, "
+                                        f"{len(enriched_data['relationships'])} rels (⏱️  {chunk_time:.2f}s)")
+                                
+                            except Exception as e:
+                                console.log(f"[yellow]⚠️  Error processing chunk {abs_chunk_idx + 1}: {e}[/yellow]")
+                                console.log(f"[yellow]⏭️  Skipping to next chunk...[/yellow]")
+                                
+                                # Update progress even on error
+                                elapsed = time.time() - pipeline_start_time
+                                chunks_done = batch_start_idx + local_idx + 1
+                                speed = chunks_done / elapsed if elapsed > 0 else 0
+                                remaining_chunks = len(text_nodes) - chunks_done
+                                avg_time_per_chunk = elapsed / chunks_done if chunks_done > 0 else 0
+                                eta_seconds = remaining_chunks * avg_time_per_chunk
+                                
+                                if eta_seconds > 0:
+                                    eta_td = timedelta(seconds=int(eta_seconds))
+                                    hours, remainder = divmod(eta_td.seconds, 3600)
+                                    minutes, seconds = divmod(remainder, 60)
+                                    if eta_td.days > 0:
+                                        eta_str = f"{eta_td.days}d {hours:02d}h{minutes:02d}m"
+                                    elif hours > 0:
+                                        eta_str = f"{hours:02d}h{minutes:02d}m{seconds:02d}s"
+                                    else:
+                                        eta_str = f"{minutes:02d}m{seconds:02d}s"
+                                else:
+                                    eta_str = "calculating..."
+                                
+                                progress.update(task_id, advance=1, speed=f"{speed:.2f} it/s", eta=eta_str)
+                                continue
                         
-                        # Update final counts in progress
-                        progress.update(
-                            task_id,
-                            nodes=total_nodes_loaded,
-                            rels=total_relationships_loaded
-                        )
-                        
-                        console.log(f"[green]✅ Batch {batch_idx + 1} loaded successfully![/green]")
-                        
-                        # Calculate batch processing time
-                        batch_processing_time = time.time() - batch_start_time
-                        
-                        # Save checkpoint after successful batch
-                        save_checkpoint(
-                            chunk_index=abs_end - 1,  # Last chunk in this batch
-                            total_chunks=original_chunk_count,
-                            nodes_loaded=total_nodes_loaded,
-                            relationships_loaded=total_relationships_loaded
-                        )
-                        console.log(f"💾 Checkpoint saved")
-                        
-                        # Save batch data to JSON
-                        try:
-                            batch_file = save_batch_json(
-                                batch_number=batch_idx + 1,
-                                chunk_range=(abs_start, abs_end - 1),
-                                nodes=all_enriched_nodes,
-                                relationships=all_enriched_relationships,
-                                processing_time=batch_processing_time
-                            )
-                            console.log(f"[cyan]📄 JSON saved: {batch_file.name}[/cyan]")
-                        except Exception as json_error:
-                            console.log(f"[yellow]⚠️  JSON save failed: {json_error}[/yellow]")
-                            console.log(f"[yellow]   Data is in Neo4j, JSON backup not created for this batch[/yellow]")
-                        
-                    except Exception as e:
-                        console.log(f"[red]❌ Error loading batch to Neo4j: {e}[/red]")
-                        console.log(f"[yellow]⚠️  Continuing with next batch...[/yellow]")
-                        continue
-                else:
-                    console.log(f"[yellow]⚠️  No data extracted from batch {batch_idx + 1}[/yellow]")
+                        # Load batch to Neo4j
+                        if all_enriched_nodes or all_enriched_relationships:
+                            console.log(f"💾 Loading batch to Neo4j... (Nodes: {len(all_enriched_nodes)}, Rels: {len(all_enriched_relationships)})")
+                            
+                            try:
+                                with neo4j_driver.session(database=NEO4J_DATABASE) as session:
+                                    if all_enriched_nodes:
+                                        session.execute_write(load_nodes_to_neo4j, all_enriched_nodes)
+                                        total_nodes_loaded += len(all_enriched_nodes)
+                                    
+                                    if all_enriched_relationships:
+                                        session.execute_write(load_relationships_to_neo4j, all_enriched_relationships)
+                                        total_relationships_loaded += len(all_enriched_relationships)
+                                
+                                # Update final counts in progress
+                                progress.update(
+                                    task_id,
+                                    nodes=total_nodes_loaded,
+                                    rels=total_relationships_loaded
+                                )
+                                
+                                console.log(f"[green]✅ Batch {batch_idx + 1} loaded successfully![/green]")
+                                
+                                # Calculate batch processing time
+                                batch_processing_time = time.time() - batch_start_time
+                                
+                                # Save checkpoint after successful batch (with document info)
+                                save_checkpoint(
+                                    doc_index=doc_idx,
+                                    doc_id=source_id,
+                                    total_docs=len(document_paths),
+                                    chunk_index=abs_end - 1,  # Last chunk in this batch
+                                    total_chunks_in_doc=original_chunk_count,
+                                    completed_docs=completed_documents,
+                                    nodes_loaded=total_nodes_loaded,
+                                    relationships_loaded=total_relationships_loaded
+                                )
+                                console.log(f"💾 Checkpoint saved")
+                                
+                                # Save batch data to JSON
+                                try:
+                                    batch_file = save_batch_json(
+                                        batch_number=batch_idx + 1,
+                                        chunk_range=(abs_start, abs_end - 1),
+                                        nodes=all_enriched_nodes,
+                                        relationships=all_enriched_relationships,
+                                        processing_time=batch_processing_time
+                                    )
+                                    console.log(f"[cyan]📄 JSON saved: {batch_file.name}[/cyan]")
+                                except Exception as json_error:
+                                    console.log(f"[yellow]⚠️  JSON save failed: {json_error}[/yellow]")
+                                    console.log(f"[yellow]   Data is in Neo4j, JSON backup not created for this batch[/yellow]")
+                                
+                            except Exception as e:
+                                console.log(f"[red]❌ Error loading batch to Neo4j: {e}[/red]")
+                                console.log(f"[yellow]⚠️  Continuing with next batch...[/yellow]")
+                                continue
+                        else:
+                            console.log(f"[yellow]⚠️  No data extracted from batch {batch_idx + 1}[/yellow]")
+            
+            # Document processing complete - mark as done
+            completed_documents.append(source_id)
+            console.print(f"\n[green]✅ Document {source_id} completed successfully![/green]")
+            console.print(f"   Nodes: {total_nodes_loaded:,} | Relationships: {total_relationships_loaded:,}\n")
+            
+            # Reset start_chunk for next document
+            start_chunk = 0
+    
+    # End of document loop
     
     except KeyboardInterrupt:
         print("\n\n⚠️  Pipeline interrupted by user (Ctrl+C)")
@@ -735,7 +797,7 @@ def main():
     print("="*60)
     
     print(f"\n📊 Processing Summary:")
-    print(f"  • Total chunks processed: {len(text_nodes)}")
+    print(f"  • Total documents processed: {len(completed_documents)}/{len(document_paths)}")
     print(f"  • Nodes loaded: {total_nodes_loaded:,}")
     print(f"  • Relationships loaded: {total_relationships_loaded:,}")
     
@@ -744,51 +806,52 @@ def main():
     print(f"  • Start: {datetime.fromtimestamp(pipeline_start_time).strftime('%H:%M:%S')}")
     print(f"  • End: {datetime.now().strftime('%H:%M:%S')}")
     
-    if chunk_times:
-        avg_chunk_time = sum(chunk_times) / len(chunk_times)
-        min_chunk_time = min(chunk_times)
-        max_chunk_time = max(chunk_times)
-        chunks_per_sec = len(chunk_times) / total_elapsed if total_elapsed > 0 else 0
-        
-        print(f"  • Average time/chunk: {avg_chunk_time:.2f}s")
-        print(f"  • Min time/chunk: {min_chunk_time:.2f}s")
-        print(f"  • Max time/chunk: {max_chunk_time:.2f}s")
-        print(f"  • Processing speed: {chunks_per_sec:.3f} chunks/s ({chunks_per_sec*60:.1f} chunks/min)")
-        
-        if total_nodes_loaded > 0:
-            nodes_per_sec = total_nodes_loaded / total_elapsed
-            rels_per_sec = total_relationships_loaded / total_elapsed
-            print(f"  • Throughput: {nodes_per_sec:.1f} nodes/s, {rels_per_sec:.1f} rels/s")
+    if total_nodes_loaded > 0 and total_elapsed > 0:
+        nodes_per_sec = total_nodes_loaded / total_elapsed
+        rels_per_sec = total_relationships_loaded / total_elapsed
+        docs_per_hour = (len(completed_documents) / total_elapsed) * 3600 if total_elapsed > 0 else 0
+        print(f"  • Throughput: {nodes_per_sec:.1f} nodes/s, {rels_per_sec:.1f} rels/s")
+        print(f"  • Processing speed: {docs_per_hour:.1f} documents/hour")
     
     # Save final pipeline metadata
     print(f"\n📄 Saving pipeline metadata...")
-    metadata_file = save_pipeline_metadata(
-        total_batches=num_batches,
-        total_chunks=len(text_nodes),
-        total_nodes=total_nodes_loaded,
-        total_rels=total_relationships_loaded,
-        start_time=pipeline_start_time,
-        end_time=time.time()
-    )
-    print(f"  ✅ Metadata saved: {metadata_file}")
+    try:
+        metadata_file = OUTPUT_DIR / "pipeline_metadata.json"
+        metadata = {
+            "documents_processed": len(completed_documents),
+            "total_documents": len(document_paths),
+            "total_nodes": total_nodes_loaded,
+            "total_relationships": total_relationships_loaded,
+            "duration_seconds": round(total_elapsed, 2),
+            "start_time": datetime.fromtimestamp(pipeline_start_time).isoformat(),
+            "end_time": datetime.now().isoformat()
+        }
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"  ✅ Metadata saved: {metadata_file}")
+    except Exception as e:
+        print(f"  ⚠️  Could not save metadata: {e}")
     
     # Mark checkpoint as complete
-    if start_chunk + len(text_nodes) >= original_chunk_count or not TEST_MODE:
-        mark_checkpoint_complete(total_nodes_loaded, total_relationships_loaded)
-        print(f"\n✅ Pipeline marked as complete in checkpoint")
+    mark_checkpoint_complete(
+        total_docs=len(completed_documents),
+        total_nodes=total_nodes_loaded,
+        total_relationships=total_relationships_loaded
+    )
+    print(f"\n✅ Pipeline marked as complete in checkpoint")
     
     if TEST_MODE:
-        print(f"\n⚠️  TEST MODE was enabled - only 10 chunks processed")
-        print(f"  To process full document, run: python run_pipeline.py --full-run")
+        print(f"\n⚠️  TEST MODE was enabled - only 10 chunks per document")
+        print(f"  To process full documents, run: python run_pipeline.py --full-run")
     
-    print(f"\n💡 Resume options:")
+    print(f"\n💡 Usage options:")
     print(f"  • Resume from checkpoint: python run_pipeline.py --resume")
-    print(f"  • Start from specific chunk: python run_pipeline.py --start-chunk N")
-    print(f"  • Process all chunks: python run_pipeline.py --full-run")
+    print(f"  • Process specific document: python run_pipeline.py --single-document path/to/file.txt")
+    print(f"  • Process all documents: python run_pipeline.py --full-run")
     
     print(f"\n📂 Output Files:")
     print(f"  • JSON batches: {OUTPUT_DIR.absolute()}")
-    print(f"  • Batch files: {num_batches} files (batch_####.json)")
+    print(f"  • Completed documents: {len(completed_documents)}")
     print(f"  • Metadata: pipeline_metadata.json")
     
     print(f"\n✅ Access your graph at: http://localhost:7474")
