@@ -311,16 +311,13 @@ def apply_species_logic_to_node(node, document_context):
             node['species'] = document_context['primary_species']
             node['species_confidence'] = 'inherited'
         
-        # Include species in ontology_id to make it a different entity
-        if 'species' in node and node['species']:
-            species_suffix = node['species'].replace(' ', '_').replace('(', '').replace(')', '')
-            # Only add suffix if not already present
-            if species_suffix not in node.get('ontology_id', ''):
-                node['ontology_id'] = f"{node['ontology_id']}_{species_suffix}"
+        # Mark that this node needs species in ontology_id (will be added after standardization)
+        node['_needs_species_suffix'] = True
     else:
         # Species is NOT part of identity - remove from node if present
         node.pop('species', None)
         node.pop('species_confidence', None)
+        node['_needs_species_suffix'] = False
     
     return node
 
@@ -1320,7 +1317,7 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
             ontology_id = standard_info['ontology_id']
             
             # For species-specific nodes, include species in the ontology_id
-            if entity.get('species'):
+            if entity.get('_needs_species_suffix') and entity.get('species'):
                 species_suffix = entity['species'].replace(' ', '_').replace('(', '').replace(')', '')
                 if species_suffix not in ontology_id:
                     ontology_id = f"{ontology_id}_{species_suffix}"
@@ -1355,6 +1352,9 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
                     node_data["species"] = entity['species']
                     if entity.get('species_confidence'):
                         node_data["species_confidence"] = entity['species_confidence']
+                
+                # Clean up internal flags
+                entity.pop('_needs_species_suffix', None)
                 
                 enriched_nodes[ontology_id] = node_data
             entity_to_id_map[entity_key] = ontology_id
