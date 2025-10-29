@@ -2,6 +2,8 @@ import os
 import json
 import re
 import hashlib
+import time
+from functools import wraps
 from getpass import getpass
 
 # Core libraries
@@ -65,6 +67,49 @@ print("Configuration loaded.")
 
 
 # =============================================================================
+# RETRY DECORATOR FOR TRANSIENT FAILURES
+# =============================================================================
+def retry_on_failure(max_retries=3, initial_delay=1.0, backoff_factor=2.0, exceptions=(Exception,)):
+    """
+    Decorator to retry a function on failure with exponential backoff.
+    
+    Args:
+        max_retries: Maximum number of retry attempts (default: 3)
+        initial_delay: Initial delay in seconds before first retry (default: 1.0)
+        backoff_factor: Multiplier for delay after each retry (default: 2.0)
+        exceptions: Tuple of exception types to catch and retry (default: all exceptions)
+    
+    Returns:
+        Decorated function that retries on failure
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    
+                    if attempt < max_retries:
+                        print(f"  - ⚠️  Attempt {attempt + 1}/{max_retries + 1} failed: {str(e)[:100]}")
+                        print(f"  - 🔄 Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        delay *= backoff_factor
+                    else:
+                        print(f"  - ❌ All {max_retries + 1} attempts failed")
+                        raise last_exception
+            
+            # Should never reach here, but just in case
+            raise last_exception
+        return wrapper
+    return decorator
+
+
+# =============================================================================
 # STEP 2.5: LLM INITIALIZATION
 # Initialize AWS Bedrock LLM for entity extraction
 # =============================================================================
@@ -82,7 +127,7 @@ def initialize_llm():
             model="us.anthropic.claude-3-7-sonnet-20250219-v1:0",  # Inference profile
             region_name=AWS_REGION,
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=8192,  # Increased to handle large entity/relationship lists
             context_size=200000,  # Claude 3.7 Sonnet has 200K context window
             additional_kwargs={
                 "top_p": 0.9,
@@ -595,33 +640,39 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
     # 2. Create context-rich string for the API
     text_for_api = f"{expanded_name} ({entity_type})"
 
-    # 3. Define API calling function
+    # 3. Define API calling function (with retry logic)
     def try_api(api_name: str):
-        """Helper function to call either SNOMED or RxNorm API."""
-        try:
+        """Helper function to call either SNOMED or RxNorm API with retry."""
+        @retry_on_failure(max_retries=2, initial_delay=1.0, backoff_factor=2.0)
+        def call_aws_api():
             if api_name == "snomed":
                 response = aws_client.infer_snomedct(Text=text_for_api)
-                entities = response.get('Entities', [])
                 concept_key = 'SNOMEDCTConcepts'
                 api_prefix = 'SNOMEDCT'
             elif api_name == "rxnorm":
                 response = aws_client.infer_rx_norm(Text=text_for_api)
-                entities = response.get('Entities', [])
                 concept_key = 'RxNormConcepts'
                 api_prefix = 'RXNORM'
             else:
+                return None, None, None
+            
+            return response.get('Entities', []), concept_key, api_prefix
+        
+        try:
+            entities, concept_key, api_prefix = call_aws_api()
+            
+            if not entities:
                 return None
 
             # Find the best concept from the response
             best_concept = None
             highest_score = 0.0
 
-            if entities:
-                for entity in entities:
-                    for concept in entity.get(concept_key, []):
-                        if concept['Score'] > highest_score:
-                            highest_score = concept['Score']
-                            best_concept = concept
+            for entity in entities:
+                for concept in entity.get(concept_key, []):
+                    if concept['Score'] > highest_score:
+                        highest_score = concept['Score']
+                        best_concept = concept
 
             if best_concept and highest_score >= MIN_CONFIDENCE_SCORE:
                 return {
@@ -633,7 +684,7 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
             return None
 
         except Exception as e:
-            print(f"  - AWS {api_name.upper()} API Error for '{entity_name}': {e}")
+            print(f"  - AWS {api_name.upper()} API Error for '{entity_name}' (all retries failed): {e}")
             return None
 
     try:
@@ -791,6 +842,11 @@ def get_synonyms_from_text_search(entity_name: str, entity_type: str, umls_curso
         
     except Exception as e:
         print(f"Error in text-based synonym search for '{entity_name}': {e}")
+        # Rollback the transaction to recover from error
+        try:
+            umls_cursor.connection.rollback()
+        except:
+            pass
         return []
 
 def get_synonyms(ontology_id: str, umls_cursor, original_entity_name: str = None, entity_type: str = None) -> list:
@@ -903,6 +959,11 @@ def get_synonyms(ontology_id: str, umls_cursor, original_entity_name: str = None
         
     except Exception as e:
         print(f"Error getting synonyms for {ontology_id}: {e}")
+        # Rollback the transaction to recover from error
+        try:
+            umls_cursor.connection.rollback()
+        except:
+            pass
         return []
 
 # --- 5c. Vector Embedding ---
@@ -925,18 +986,22 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
     """
     print("  - Sending chunk to LLM for initial extraction")
 
-    # 1. Initial Extraction with Live LLM
+    # 1. Initial Extraction with Live LLM (with retries for transient failures)
     prompt = EXTRACTION_PROMPT_TEMPLATE.format(
         node_types=', '.join(COMPREHENSIVE_SCHEMA['node_types']),
         relationship_types=', '.join(COMPREHENSIVE_SCHEMA['relationship_types']),
         text_chunk=text_chunk
     )
-    try:
+    
+    @retry_on_failure(max_retries=3, initial_delay=2.0, backoff_factor=2.0)
+    def call_llm_with_retry():
         response = llm.complete(prompt)
-        llm_output_text = response.text
-        # print("LLM response: ", llm_output_text)
+        return response.text
+    
+    try:
+        llm_output_text = call_llm_with_retry()
     except Exception as e:
-        print(f"  - LLM API Error: {e}")
+        print(f"  - LLM API Error (all retries failed): {e}")
         return {"nodes": [], "relationships": []} # Return empty on error
     
     # print("LLM response: ", llm_output_text)
@@ -954,10 +1019,36 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
         entities = raw_data.get("entities", [])
         relationships = raw_data.get("relationships", [])
         print(f"  - LLM extracted {len(entities)} entities and {len(relationships)} relationships.")
-    except json.JSONDecodeError:
-        print("  - ERROR: LLM did not return a valid JSON object.")
-        print("  - Raw LLM Output:\n", llm_output_text)
-        return {"nodes": [], "relationships": []}
+    except json.JSONDecodeError as e:
+        # Try to recover from truncated JSON by closing brackets
+        print(f"  - WARNING: JSON parse error, attempting recovery...")
+        try:
+            # Count brackets to see if JSON is incomplete
+            open_braces = json_str.count('{')
+            close_braces = json_str.count('}')
+            open_brackets = json_str.count('[')
+            close_brackets = json_str.count(']')
+            
+            # Try to close incomplete JSON
+            fixed_json = json_str
+            if open_brackets > close_brackets:
+                fixed_json += ']' * (open_brackets - close_brackets)
+            if open_braces > close_braces:
+                fixed_json += '}' * (open_braces - close_braces)
+            
+            raw_data = json.loads(fixed_json)
+            entities = raw_data.get("entities", [])
+            relationships = raw_data.get("relationships", [])
+            print(f"  - ✅ Recovered! Extracted {len(entities)} entities and {len(relationships)} relationships.")
+        except:
+            print("  - ERROR: LLM did not return a valid JSON object (recovery failed).")
+            print(f"  - Parse error: {e}")
+            if len(llm_output_text) > 500:
+                print(f"  - Output preview (first 500 chars):\n{llm_output_text[:500]}...")
+                print(f"  - Output preview (last 500 chars):\n...{llm_output_text[-500:]}")
+            else:
+                print(f"  - Raw LLM Output:\n{llm_output_text}")
+            return {"nodes": [], "relationships": []}
 
 
     # 3. Enrich Entities
