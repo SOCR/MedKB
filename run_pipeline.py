@@ -748,6 +748,13 @@ def main():
                         else:
                             console.log(f"[yellow]⚠️  No data extracted from batch {batch_idx + 1}[/yellow]")
             
+            except Exception as e:
+                console.print(f"[red]❌ Error during batch processing for document {source_id}: {e}[/red]")
+                console.print(f"[yellow]⏭️  Skipping to next document...[/yellow]\n")
+                import traceback
+                traceback.print_exc()
+                continue
+            
             # Document processing complete - mark as done
             completed_documents.append(source_id)
             console.print(f"\n[green]✅ Document {source_id} completed successfully![/green]")
