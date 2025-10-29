@@ -67,6 +67,64 @@ print("Configuration loaded.")
 
 
 # =============================================================================
+# DOCUMENT CONTEXT & SPECIES CONFIGURATION
+# =============================================================================
+
+# Species-specific node types (species is part of entity identity)
+SPECIES_SPECIFIC_NODE_TYPES = ['Gene', 'Protein', 'Anatomy', 'Cell_Type']
+
+# Document context extraction prompt
+DOCUMENT_CONTEXT_EXTRACTION_PROMPT = """
+Analyze the beginning of this research paper and extract metadata in JSON format.
+
+**TEXT (first 75 lines):**
+{header_text}
+
+**INSTRUCTIONS:**
+Extract the following information:
+
+1. **Bibliographic metadata:**
+   - title: Full paper title
+   - authors: Author list (format: "FirstAuthor, SecondAuthor, et al." - max 3 names)
+   - journal: Journal or publication name
+   - publication_year: Year only (YYYY format)
+   - doi: DOI if present, otherwise null
+
+2. **Species information:**
+   - primary_species: Scientific name of PRIMARY organism studied
+     * Look in Abstract and Methods sections
+     * Examples: "Homo sapiens", "Mus musculus", "Rattus norvegicus"
+     * If human clinical/medical context with no explicit mention: "Homo sapiens (implied)"
+     * If computational/review with no specific organism: "not specified"
+   - species_confidence: "high" (explicitly stated), "medium" (implied from context), "low" (unclear)
+   - species_evidence: Brief quote showing where species was found (max 100 chars)
+
+3. **Study type:**
+   - study_type: "clinical trial" | "animal study" | "in vitro" | "computational" | "review" | "case report" | "other"
+
+**IMPORTANT:**
+- Return ONLY valid JSON, no other text
+- If a field cannot be determined, use "Unknown" for strings or null for optional fields
+- Use exact scientific names for species (capitalize genus, lowercase species epithet)
+
+Return JSON:
+{{
+    "title": "string",
+    "authors": "string",
+    "journal": "string", 
+    "publication_year": "YYYY",
+    "doi": "string or null",
+    "primary_species": "string",
+    "species_confidence": "high|medium|low",
+    "species_evidence": "string",
+    "study_type": "string"
+}}
+"""
+
+print("Document context configuration loaded.")
+
+
+# =============================================================================
 # RETRY DECORATOR FOR TRANSIENT FAILURES
 # =============================================================================
 def retry_on_failure(max_retries=3, initial_delay=1.0, backoff_factor=2.0, exceptions=(Exception,)):
@@ -146,6 +204,151 @@ def initialize_llm():
         raise RuntimeError(f"Could not initialize AWS Bedrock LLM: {e}")
 
 print("LLM initialization function defined.")
+
+
+# =============================================================================
+# DOCUMENT CONTEXT EXTRACTION FUNCTIONS
+# =============================================================================
+
+@retry_on_failure(max_retries=3, base_delay=2.0)
+def extract_document_context(file_path, source_id, llm):
+    """
+    Extract complete document context (metadata + species) in single LLM call.
+    
+    Args:
+        file_path: Path to the document text file
+        source_id: Unique identifier for the source (e.g., "PMC8675309")
+        llm: Initialized LLM instance
+        
+    Returns:
+        dict: Complete document context with metadata and species information
+    """
+    from datetime import datetime
+    from pathlib import Path
+    
+    # Read first 75 lines from document
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            header_lines = []
+            for _ in range(75):
+                line = f.readline()
+                if not line:
+                    break
+                header_lines.append(line)
+            header_text = ''.join(header_lines)
+    except Exception as e:
+        print(f"  ⚠️  Error reading file {file_path}: {e}")
+        raise
+    
+    # Extract metadata via LLM
+    prompt = DOCUMENT_CONTEXT_EXTRACTION_PROMPT.format(header_text=header_text)
+    
+    try:
+        response = llm.complete(prompt)
+        response_text = response.text if hasattr(response, 'text') else str(response)
+        
+        # Clean response (remove markdown code blocks if present)
+        response_text = response_text.strip()
+        if response_text.startswith('```json'):
+            response_text = response_text[7:]
+        if response_text.startswith('```'):
+            response_text = response_text[3:]
+        if response_text.endswith('```'):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        metadata = json.loads(response_text)
+        
+        # Add additional fields
+        metadata['source_id'] = source_id
+        metadata['source_type'] = 'research_article'
+        metadata['source_platform'] = 'PubMed Central'
+        metadata['processing_date'] = datetime.now().isoformat()
+        metadata['document_path'] = str(Path(file_path).absolute())
+        
+        return metadata
+        
+    except json.JSONDecodeError as e:
+        print(f"  ⚠️  Failed to parse document context JSON: {e}")
+        print(f"  Using safe defaults for {source_id}")
+        # Return safe defaults
+        return {
+            'source_id': source_id,
+            'title': 'Unknown',
+            'authors': 'Unknown',
+            'journal': 'Unknown',
+            'publication_year': 'Unknown',
+            'doi': None,
+            'primary_species': 'not specified',
+            'species_confidence': 'low',
+            'species_evidence': 'Unable to extract',
+            'study_type': 'other',
+            'source_type': 'research_article',
+            'source_platform': 'PubMed Central',
+            'processing_date': datetime.now().isoformat(),
+            'document_path': str(Path(file_path).absolute())
+        }
+
+
+def apply_species_logic_to_node(node, document_context):
+    """
+    Apply species handling rules to extracted nodes.
+    Species-specific node types get species in their identity.
+    
+    Args:
+        node: Dict representing an extracted entity
+        document_context: Document metadata with species info
+        
+    Returns:
+        dict: Node with correct species handling applied
+    """
+    node_type = node.get('entity_type', '')
+    
+    # Check if this node type is species-specific
+    if node_type in SPECIES_SPECIFIC_NODE_TYPES:
+        # Species IS part of identity
+        if 'species' not in node or not node['species']:
+            node['species'] = document_context['primary_species']
+            node['species_confidence'] = 'inherited'
+        
+        # Include species in ontology_id to make it a different entity
+        if 'species' in node and node['species']:
+            species_suffix = node['species'].replace(' ', '_').replace('(', '').replace(')', '')
+            # Only add suffix if not already present
+            if species_suffix not in node.get('ontology_id', ''):
+                node['ontology_id'] = f"{node['ontology_id']}_{species_suffix}"
+    else:
+        # Species is NOT part of identity - remove from node if present
+        node.pop('species', None)
+        node.pop('species_confidence', None)
+    
+    return node
+
+
+def apply_species_logic_to_relationship(rel, document_context):
+    """
+    Ensure all relationships have species metadata.
+    
+    Args:
+        rel: Dict representing an extracted relationship
+        document_context: Document metadata with species info
+        
+    Returns:
+        dict: Relationship with species fields populated
+    """
+    # Always require species in relationships
+    if 'species' not in rel or not rel['species']:
+        rel['species'] = document_context['primary_species']
+        rel['species_confidence'] = 'inherited'
+    
+    # Validate species_confidence
+    if 'species_confidence' not in rel or not rel['species_confidence']:
+        rel['species_confidence'] = 'inherited'
+    
+    return rel
+
+
+print("Document context extraction functions defined.")
 
 
 # =============================================================================
@@ -234,6 +437,12 @@ EXTRACTION_PROMPT_TEMPLATE = """
 -GOAL-
 You are a world-class biomedical informatics expert. Your task is to act as a precision knowledge extraction engine from a given medical text document. Identify all relevant medical entities and their relationships according to the provided schema.
 
+-DOCUMENT CONTEXT-
+**Source:** {source_title}
+**Journal:** {source_journal} ({source_year})
+**Primary Species Studied:** {document_species}
+**Study Type:** {study_type}
+
 -SCHEMA DEFINITION-
 Node Types: {node_types}
 Relationship Types: {relationship_types}
@@ -248,11 +457,35 @@ Relationship Types: {relationship_types}
 - Example: "MRI" → "Magnetic Resonance Imaging"
 - If unsure about an abbreviation, use your best medical knowledge based on context
 
+**SPECIES HANDLING RULES:**
+
+For ENTITIES:
+- For node types: Gene, Protein, Anatomy, Cell_Type → INCLUDE "species" field
+  Example: {{"entity_name": "TP53", "entity_type": "Gene", "species": "Homo sapiens", ...}}
+  
+- For node types: Drug, Disease, Treatment, Symptom, Medication, Biological_Process, Pathogen, etc. → DO NOT include "species" field
+  Example: {{"entity_name": "Aspirin", "entity_type": "Drug", ...}}  ← No species field
+
+For RELATIONSHIPS:
+- ALWAYS include "species" and "species_confidence" fields
+- Default species: {document_species}
+- **species_confidence** options:
+  * "explicit": Species is directly mentioned in the text chunk
+  * "inherited": Species not mentioned in chunk, using document default ({document_species})
+  * "speculative": Discussing hypothetical cross-species implications
+  * "unknown": Cannot determine species
+
+Examples:
+- Chunk says "In mice, drug X reduced tumors" → species: "Mus musculus", species_confidence: "explicit"
+- Chunk says "Drug X reduced tumors" (no species mentioned) → species: "{document_species}", species_confidence: "inherited"
+- Chunk says "This may be applicable to humans" → species: "Homo sapiens", species_confidence: "speculative"
+
 -EXTRACTION STEPS-
 1.  **Identify Entities:** Carefully read the text and identify all terms that match one of the node types in the schema. For each entity, you must extract:
     - `entity_name`: **ALWAYS use the fully expanded medical term, never abbreviations**
     - `entity_type`: The corresponding type from the schema's Node Types list.
     - `entity_description`: A concise, one-sentence description of the entity based on its context in the text.
+    - `species`: ONLY for Gene, Protein, Anatomy, Cell_Type entities (see SPECIES HANDLING RULES above)
 
 2.  **Identify Relationships:** Identify all relationships between the entities you found. The relationship must match one of the types in the schema. For each relationship, you must extract:
     - `source_entity_name`: The name of the source entity.
@@ -261,6 +494,8 @@ Relationship Types: {relationship_types}
     - `target_entity_type`: The type of the target entity.
     - `relation_type`: The corresponding type from the schema's Relationship Types list.
     - `relationship_description`: A concise, one-sentence explanation of the relationship based on the text.
+    - `species`: The species this relationship applies to (REQUIRED - see SPECIES HANDLING RULES)
+    - `species_confidence`: How certain the species assignment is (REQUIRED - see SPECIES HANDLING RULES)
 
 -OUTPUT FORMATTING-
 1.  **CRITICAL:** Your entire response must be ONLY a single, valid JSON object. Do not include any introductory text, greetings, or markdown formatting like ```json.
@@ -272,10 +507,11 @@ Relationship Types: {relationship_types}
 ```json
 {{
   "entities": [
-    {{"entity_name": "Example Disease", "entity_type": "Disease", "entity_description": "A sample description."}}
+    {{"entity_name": "Aspirin", "entity_type": "Drug", "entity_description": "A common pain reliever and anti-inflammatory medication."}},
+    {{"entity_name": "TP53", "entity_type": "Gene", "species": "Homo sapiens", "entity_description": "A tumor suppressor gene that regulates cell division."}}
   ],
   "relationships": [
-    {{"source_entity_name": "Example Disease", "source_entity_type": "Disease", "target_entity_name": "Example Symptom", "target_entity_type": "Symptom", "relation_type": "HAS_SYMPTOM", "relationship_description": "A sample relationship description."}}
+    {{"source_entity_name": "Aspirin", "source_entity_type": "Drug", "target_entity_name": "Inflammation", "target_entity_type": "Pathological_Finding", "relation_type": "TREATS", "relationship_description": "Aspirin reduces inflammation by inhibiting prostaglandin synthesis.", "species": "Homo sapiens", "species_confidence": "inherited"}}
   ]
 }}
 ```
@@ -980,9 +1216,20 @@ def get_embedding(text: str, embedding_model) -> list:
         return []
 
 # --- 5d. Main Orchestration Function ---
-def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_model) -> dict:
+def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client, umls_cursor, embedding_model) -> dict:
     """
     Orchestrates the entire enrichment pipeline for a single chunk of text.
+    
+    Args:
+        text_chunk: The text content to process
+        document_context: Document metadata including species and source information
+        llm: Initialized LLM instance
+        aws_client: AWS Comprehend Medical client
+        umls_cursor: PostgreSQL cursor for UMLS database
+        embedding_model: Sentence transformer model for embeddings
+        
+    Returns:
+        dict: Processed nodes and relationships with species and source metadata
     """
     print("  - Sending chunk to LLM for initial extraction")
 
@@ -990,7 +1237,13 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
     prompt = EXTRACTION_PROMPT_TEMPLATE.format(
         node_types=', '.join(COMPREHENSIVE_SCHEMA['node_types']),
         relationship_types=', '.join(COMPREHENSIVE_SCHEMA['relationship_types']),
-        text_chunk=text_chunk
+        text_chunk=text_chunk,
+        # Document context for species handling
+        source_title=document_context.get('title', 'Unknown'),
+        source_journal=document_context.get('journal', 'Unknown'),
+        source_year=document_context.get('publication_year', 'Unknown'),
+        document_species=document_context.get('primary_species', 'not specified'),
+        study_type=document_context.get('study_type', 'other')
     )
     
     @retry_on_failure(max_retries=3, initial_delay=2.0, backoff_factor=2.0)
@@ -1057,11 +1310,20 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
     if entities:
         print(f"  - Standardizing and enriching {len(entities)} entities...")
         for entity in entities:
+            # Apply species logic BEFORE standardization (affects ontology_id for species-specific types)
+            entity = apply_species_logic_to_node(entity, document_context)
+            
             # Use a tuple to handle cases where the same name might have different types
             entity_key = (entity['entity_name'], entity['entity_type'])
 
             standard_info = standardize_entity(entity['entity_name'], entity['entity_type'], aws_client)
             ontology_id = standard_info['ontology_id']
+            
+            # For species-specific nodes, include species in the ontology_id
+            if entity.get('species'):
+                species_suffix = entity['species'].replace(' ', '_').replace('(', '').replace(')', '')
+                if species_suffix not in ontology_id:
+                    ontology_id = f"{ontology_id}_{species_suffix}"
 
             if ontology_id not in enriched_nodes:
                 # Use hybrid synonym lookup with original entity information
@@ -1077,14 +1339,24 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
                 # Combine original entity name with found synonyms (deduplicated)
                 all_synonyms = list(set([entity['entity_name']] + synonyms))
 
-                enriched_nodes[ontology_id] = {
+                # Build node with species and source metadata
+                node_data = {
                     "ontology_id": ontology_id,
                     "label": entity['entity_type'],
                     "standard_name": standard_info['standard_name'],
                     "synonyms": all_synonyms,
                     "description": entity['entity_description'],
-                    "embedding": embedding
+                    "embedding": embedding,
+                    "source_id": document_context['source_id']
                 }
+                
+                # Add species for species-specific node types
+                if entity.get('species'):
+                    node_data["species"] = entity['species']
+                    if entity.get('species_confidence'):
+                        node_data["species_confidence"] = entity['species_confidence']
+                
+                enriched_nodes[ontology_id] = node_data
             entity_to_id_map[entity_key] = ontology_id
 
     # 4. Map Relationships using the generated IDs
@@ -1092,6 +1364,9 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
     if relationships:
         print(f"  - Mapping {len(relationships)} relationships...")
         for rel in relationships:
+            # Apply species logic to relationship
+            rel = apply_species_logic_to_relationship(rel, document_context)
+            
             source_key = (rel['source_entity_name'], rel['source_entity_type'])
             target_key = (rel['target_entity_name'], rel['target_entity_type'])
 
@@ -1103,7 +1378,10 @@ def process_text_chunk(text_chunk: str, llm, aws_client, umls_cursor, embedding_
                     "source_id": source_id,
                     "target_id": target_id,
                     "label": rel['relation_type'],
-                    "description": rel['relationship_description']
+                    "description": rel['relationship_description'],
+                    "species": rel['species'],
+                    "species_confidence": rel['species_confidence'],
+                    "source_id_ref": document_context['source_id']  # Reference to Source node
                 })
 
     return {"nodes": list(enriched_nodes.values()), "relationships": enriched_relationships}
@@ -1118,45 +1396,85 @@ print("Enrichment pipeline functions defined.")
 # REFINED DATABASE LOADING FUNCTIONS (v1.1 - Syntax Fix)
 # =============================================================================
 
+def create_source_node(driver, document_context):
+    """
+    Create or update a Source node in Neo4j with document metadata.
+    
+    Args:
+        driver: Neo4j driver instance
+        document_context: Dictionary with document metadata
+        
+    Returns:
+        None
+    """
+    query = """
+    MERGE (s:Source {source_id: $source_id})
+    SET s.source_type = $source_type,
+        s.source_platform = $source_platform,
+        s.title = $title,
+        s.authors = $authors,
+        s.journal = $journal,
+        s.publication_year = $publication_year,
+        s.doi = $doi,
+        s.primary_species = $primary_species,
+        s.species_confidence = $species_confidence,
+        s.species_evidence = $species_evidence,
+        s.study_type = $study_type,
+        s.processing_date = $processing_date,
+        s.document_path = $document_path
+    RETURN s
+    """
+    
+    with driver.session() as session:
+        session.run(query, **document_context)
+
+
 def load_nodes_to_neo4j(tx, nodes):
     """
-    Loads a batch of nodes into Neo4j using a robust MERGE and SET pattern.
-    This version includes the correct WITH clause syntax.
+    Loads a batch of nodes into Neo4j with species and source metadata.
+    Creates EXTRACTED_FROM relationships to Source nodes.
     """
-    # This query is idempotent and handles updates.
-    query = """
+    # First, create/update entity nodes
+    node_query = """
     UNWIND $nodes as node_data
-    // Find or create the node based on its unique ontology_id
     MERGE (n {ontology_id: node_data.ontology_id})
-    // Set all properties on the node. This works for both CREATE and MATCH.
-    SET n += {
-        standard_name: node_data.standard_name,
-        synonyms: node_data.synonyms,
-        description: node_data.description,
-        embedding: node_data.embedding
-    }
-    // Correctly pass the context to the next clause
-    WITH n, node_data.label AS label
-    // Dynamically add the label to the node
+    SET n.standard_name = node_data.standard_name,
+        n.synonyms = node_data.synonyms,
+        n.description = node_data.description,
+        n.embedding = node_data.embedding
+    // Conditionally set species fields (only for species-specific node types)
+    FOREACH (ignoreMe IN CASE WHEN node_data.species IS NOT NULL THEN [1] ELSE [] END |
+        SET n.species = node_data.species,
+            n.species_confidence = node_data.species_confidence
+    )
+    WITH n, node_data.label AS label, node_data.source_id AS source_id
     CALL apoc.create.addLabels(n, [label]) YIELD node
+    // Create EXTRACTED_FROM relationship to Source node
+    WITH node, source_id
+    MATCH (s:Source {source_id: source_id})
+    MERGE (node)-[r:EXTRACTED_FROM]->(s)
+    SET r.extraction_date = datetime()
     RETURN count(node)
     """
-    tx.run(query, nodes=nodes)
+    tx.run(node_query, nodes=nodes)
 
-# The load_relationships_to_neo4j function remains the same.
 def load_relationships_to_neo4j(tx, relationships):
-    """Loads a batch of relationships into Neo4j."""
+    """
+    Loads a batch of relationships into Neo4j with species and source metadata.
+    """
     query = """
     UNWIND $relationships as rel_data
     MATCH (source {ontology_id: rel_data.source_id})
     MATCH (target {ontology_id: rel_data.target_id})
     CALL apoc.merge.relationship(source, rel_data.label, {}, {
         evidence_text: rel_data.description,
-        source_document: $source_document_name
+        species: rel_data.species,
+        species_confidence: rel_data.species_confidence,
+        source_id: rel_data.source_id_ref
     }, target) YIELD rel
     RETURN count(rel)
     """
-    tx.run(query, relationships=relationships, source_document_name=SOURCE_DOCUMENT_NAME)
+    tx.run(query, relationships=relationships)
     
 print("Neo4j loading functions initialised.")
 

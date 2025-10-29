@@ -32,6 +32,8 @@ from rich.table import Table
 from utils import (
     initialize_llm,
     process_text_chunk,
+    extract_document_context,
+    create_source_node,
     load_nodes_to_neo4j,
     load_relationships_to_neo4j,
     NEO4J_URI,
@@ -62,6 +64,75 @@ def format_time(seconds):
     else:
         hours = seconds / 3600
         return f"{hours:.2f}h"
+
+# =============================================================================
+# MULTI-DOCUMENT PROCESSING HELPERS
+# =============================================================================
+
+def get_document_list(data_directory):
+    """
+    Scan directory for text files to process.
+    
+    Args:
+        data_directory: Path to directory containing documents
+        
+    Returns:
+        list: List of Path objects for documents to process
+    """
+    data_path = Path(data_directory)
+    if not data_path.exists():
+        return []
+    
+    # Find all .txt files
+    txt_files = list(data_path.glob("*.txt"))
+    return sorted(txt_files)  # Sort for consistent ordering
+
+
+def generate_source_id(file_path):
+    """
+    Generate unique source ID from file path.
+    For PMC files: extract PMC ID from filename
+    For other files: use sanitized filename
+    
+    Args:
+        file_path: Path object for the file
+        
+    Returns:
+        str: Unique source identifier
+    """
+    filename = file_path.stem  # e.g., "PMC8675309" or "sample_text"
+    
+    # Check if PMC file
+    if filename.startswith("PMC"):
+        return filename  # Already a good ID
+    else:
+        # Sanitize filename
+        return f"DOC_{filename.replace(' ', '_')}"
+
+
+def load_document_skip_header(file_path, skip_lines=75):
+    """
+    Load document text, optionally skipping first N lines.
+    Used to skip header that was already processed for context.
+    
+    Args:
+        file_path: Path to the document file
+        skip_lines: Number of lines to skip (default: 75)
+        
+    Returns:
+        str: Document text with header removed
+    """
+    with open(file_path, 'r', encoding='utf-8') as f:
+        # Skip header lines
+        for _ in range(skip_lines):
+            line = f.readline()
+            if not line:  # End of file reached
+                break
+        
+        # Read rest of document
+        remaining_text = f.read()
+    
+    return remaining_text
 
 # =============================================================================
 # OUTPUT DIRECTORY AND JSON STORAGE
@@ -213,6 +284,10 @@ Examples:
                        help='Process all chunks (override test mode)')
     parser.add_argument('--batch-size', type=int, default=5,
                        help='Number of chunks to process per batch (default: 5)')
+    parser.add_argument('--data-directory', type=str, default='data_corpus/',
+                       help='Directory containing documents to process (default: data_corpus/)')
+    parser.add_argument('--single-document', type=str, default=None,
+                       help='Process a single document file instead of directory')
     return parser.parse_args()
 
 
@@ -308,41 +383,72 @@ def main():
     # ==========================================================================
     # STEP 2: Load and Chunk Source Document
     # ==========================================================================
-    print("📋 STEP 2: Loading and chunking source document...")
+    print("📋 STEP 2: Loading source document and extracting metadata...")
     print("-" * 60)
     
     try:
-        # Check if file exists at primary location
-        doc_path = SOURCE_DOCUMENT_PATH
-        if not os.path.exists(doc_path):
-            # Try alternative path
-            alt_path = os.path.join("data_corpus", "Biomedical_Knowledgebase.txt")
-            if os.path.exists(alt_path):
-                doc_path = alt_path
-                print(f"  📁 Using document from: {alt_path}")
-            else:
-                raise FileNotFoundError(f"Source document not found at {SOURCE_DOCUMENT_PATH} or {alt_path}")
+        # Determine which document to process
+        if args.single_document:
+            doc_path = Path(args.single_document)
+            if not doc_path.exists():
+                raise FileNotFoundError(f"Specified document not found: {args.single_document}")
+        else:
+            # Use default document
+            doc_path = Path(SOURCE_DOCUMENT_PATH)
+            if not doc_path.exists():
+                # Try alternative path
+                alt_path = Path("data_corpus") / "Biomedical_Knowledgebase.txt"
+                if alt_path.exists():
+                    doc_path = alt_path
+                    console.print(f"  📁 Using document from: {alt_path}")
+                else:
+                    raise FileNotFoundError(f"Source document not found at {SOURCE_DOCUMENT_PATH} or {alt_path}")
         
-        # Load document
-        with open(doc_path, 'r', encoding='utf-8') as f:
-            text = f.read()
+        console.print(f"  📄 Document: {doc_path.name}")
         
-        print(f"  📄 Loaded document: {len(text):,} characters")
+        # Generate source ID for this document
+        source_id = generate_source_id(doc_path)
+        console.print(f"  🆔 Source ID: {source_id}")
+        
+        # Extract document context (species + metadata) from first 75 lines
+        console.print("  🔍 Extracting document metadata and species...")
+        document_context = extract_document_context(
+            file_path=str(doc_path),
+            source_id=source_id,
+            llm=llm
+        )
+        
+        console.print(f"  ├─ Title: {document_context['title'][:80]}{'...' if len(document_context['title']) > 80 else ''}")
+        console.print(f"  ├─ Journal: {document_context['journal']}")
+        console.print(f"  ├─ Year: {document_context['publication_year']}")
+        console.print(f"  ├─ Species: {document_context['primary_species']} (confidence: {document_context['species_confidence']})")
+        console.print(f"  └─ Study Type: {document_context['study_type']}\n")
+        
+        # Create Source node in Neo4j
+        console.print("  💾 Creating Source node in Neo4j...")
+        create_source_node(neo4j_driver, document_context)
+        console.print("  ✅ Source node created\n")
+        
+        # Load document text (skip first 75 lines already processed for context)
+        text = load_document_skip_header(doc_path, skip_lines=75)
+        console.print(f"  📄 Loaded document: {len(text):,} characters (header skipped)")
         
         # Split into chunks
         documents = [Document(text=text)]
         splitter = SentenceSplitter(chunk_size=512, chunk_overlap=20)
         text_nodes = splitter.get_nodes_from_documents(documents)
         
-        print(f"  ✂️  Split into {len(text_nodes):,} chunks")
-        print(f"  ✅ Ready for processing\n")
+        console.print(f"  ✂️  Split into {len(text_nodes):,} chunks")
+        console.print(f"  ✅ Ready for processing\n")
         
     except FileNotFoundError as e:
-        print(f"\n❌ FATAL: {e}")
-        print(f"   Please ensure the source document exists")
+        console.print(f"\n❌ FATAL: {e}")
+        console.print(f"   Please ensure the source document exists")
         sys.exit(1)
     except Exception as e:
-        print(f"\n❌ FATAL: Error loading document: {e}")
+        console.print(f"\n❌ FATAL: Error loading document: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
     
     # ==========================================================================
@@ -452,9 +558,10 @@ def main():
                     text_chunk = node.get_content()
                     
                     try:
-                        # Call the main enrichment pipeline
+                        # Call the main enrichment pipeline with document context
                         enriched_data = process_text_chunk(
                             text_chunk=text_chunk,
+                            document_context=document_context,
                             llm=llm,
                             aws_client=aws_client,
                             umls_cursor=umls_cursor,
