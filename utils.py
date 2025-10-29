@@ -210,7 +210,7 @@ print("LLM initialization function defined.")
 # DOCUMENT CONTEXT EXTRACTION FUNCTIONS
 # =============================================================================
 
-@retry_on_failure(max_retries=3, base_delay=2.0)
+@retry_on_failure(max_retries=3, initial_delay=2.0)
 def extract_document_context(file_path, source_id, llm):
     """
     Extract complete document context (metadata + species) in single LLM call.
