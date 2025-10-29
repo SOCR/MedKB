@@ -1425,8 +1425,16 @@ def create_source_node(driver, document_context):
     RETURN s
     """
     
+    def _create_source(tx):
+        result = tx.run(query, **document_context)
+        return result.single()
+    
     with driver.session() as session:
-        session.run(query, **document_context)
+        result = session.execute_write(_create_source)
+        if result:
+            print(f"  ✅ Source node created/updated: {document_context['source_id']}")
+        else:
+            print(f"  ⚠️  Warning: Source node creation returned no result")
 
 
 def load_nodes_to_neo4j(tx, nodes):
@@ -1449,14 +1457,19 @@ def load_nodes_to_neo4j(tx, nodes):
     )
     WITH n, node_data.label AS label, node_data.source_id AS source_id
     CALL apoc.create.addLabels(n, [label]) YIELD node
-    // Create EXTRACTED_FROM relationship to Source node
+    // Create EXTRACTED_FROM relationship to Source node (only if Source exists)
     WITH node, source_id
-    MATCH (s:Source {source_id: source_id})
-    MERGE (node)-[r:EXTRACTED_FROM]->(s)
-    SET r.extraction_date = datetime()
-    RETURN count(node)
+    OPTIONAL MATCH (s:Source {source_id: source_id})
+    FOREACH (ignoreMe IN CASE WHEN s IS NOT NULL THEN [1] ELSE [] END |
+        MERGE (node)-[r:EXTRACTED_FROM]->(s)
+        SET r.extraction_date = datetime()
+    )
+    RETURN count(node) AS nodes_created, count(s) AS sources_found
     """
-    tx.run(node_query, nodes=nodes)
+    result = tx.run(node_query, nodes=nodes)
+    summary = result.single()
+    if summary and summary['sources_found'] == 0:
+        print(f"  ⚠️  Warning: Source node not found for some entities. EXTRACTED_FROM relationships not created.")
 
 def load_relationships_to_neo4j(tx, relationships):
     """
