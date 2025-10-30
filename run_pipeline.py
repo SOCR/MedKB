@@ -570,9 +570,10 @@ def main():
         
             try:
                 with progress:
-                    # Add overall progress task
+                    # Add overall progress task with document info
+                    doc_name = doc_path.name[:40] + "..." if len(doc_path.name) > 40 else doc_path.name
                     task_id = progress.add_task(
-                        "[bold cyan]Processing chunks...",
+                        f"[bold cyan]Doc {doc_idx + 1}/{len(document_paths)}: {doc_name}",
                         total=len(text_nodes),
                         speed="0.00 it/s",
                         eta="calculating...",
