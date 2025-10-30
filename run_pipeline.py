@@ -725,17 +725,21 @@ def main():
                                 batch_processing_time = time.time() - batch_start_time
                                 
                                 # Save checkpoint after successful batch (with document info)
-                                save_checkpoint(
-                                    doc_index=doc_idx,
-                                    doc_id=source_id,
-                                    total_docs=len(document_paths),
-                                    chunk_index=abs_end - 1,  # Last chunk in this batch
-                                    total_chunks_in_doc=original_chunk_count,
-                                    completed_docs=completed_documents,
-                                    nodes_loaded=total_nodes_loaded,
-                                    relationships_loaded=total_relationships_loaded
-                                )
-                                console.log(f"💾 Checkpoint saved")
+                                # Skip checkpoint saving in test mode to avoid overwriting production checkpoints
+                                if not TEST_MODE:
+                                    save_checkpoint(
+                                        doc_index=doc_idx,
+                                        doc_id=source_id,
+                                        total_docs=len(document_paths),
+                                        chunk_index=abs_end - 1,  # Last chunk in this batch
+                                        total_chunks_in_doc=original_chunk_count,
+                                        completed_docs=completed_documents,
+                                        nodes_loaded=total_nodes_loaded,
+                                        relationships_loaded=total_relationships_loaded
+                                    )
+                                    console.log(f"💾 Checkpoint saved")
+                                else:
+                                    console.log(f"[dim]⚠️  Test mode: checkpoint not saved[/dim]")
                                 
                                 # Save batch data to JSON
                                 try:

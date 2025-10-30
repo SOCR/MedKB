@@ -242,7 +242,7 @@ def initialize_llm_lmstudio(base_url="http://127.0.0.1:1234/v1", model_name="qwe
                 self.client = client
                 self.model_name = model_name
                 self.temperature = 0.7
-                self.max_tokens = 2048
+                self.max_tokens = 8192  # Match Claude's setting - prevents JSON truncation (Qwen3 supports up to 32K)
                 
             def complete(self, prompt, **kwargs):
                 """Complete a prompt (LlamaIndex-compatible interface)"""
