@@ -949,8 +949,9 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
         try:
             snomed_results = batch_call_api(snomed_entities, "snomed")
             
+            # First pass: match what we can
+            unmatched_snomed = []
             for ent_info in snomed_entities:
-                # Try to match by expanded name or original name
                 matched = False
                 for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
                     if text_variant in snomed_results:
@@ -959,23 +960,30 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
                         break
                 
                 if not matched:
-                    # Try fallback to RxNorm for this entity
-                    try:
-                        fallback_result = batch_call_api([ent_info], "rxnorm")
+                    unmatched_snomed.append(ent_info)
+            
+            # Second pass: batch fallback to RxNorm for ALL unmatched
+            if unmatched_snomed:
+                try:
+                    rxnorm_fallback_results = batch_call_api(unmatched_snomed, "rxnorm")
+                    
+                    for ent_info in unmatched_snomed:
                         matched_fallback = False
                         for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
-                            if text_variant in fallback_result:
-                                results[ent_info['key']] = fallback_result[text_variant]
+                            if text_variant in rxnorm_fallback_results:
+                                results[ent_info['key']] = rxnorm_fallback_results[text_variant]
                                 matched_fallback = True
                                 break
                         
                         if not matched_fallback:
-                            # No match - use fallback ID
+                            # No match in either API - use fallback ID
                             results[ent_info['key']] = {
                                 'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
                                 'standard_name': ent_info['name'].title()
                             }
-                    except:
+                except Exception as e:
+                    print(f"  - ⚠️  RxNorm fallback batch failed: {e}")
+                    for ent_info in unmatched_snomed:
                         results[ent_info['key']] = {
                             'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
                             'standard_name': ent_info['name'].title()
@@ -994,6 +1002,8 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
         try:
             rxnorm_results = batch_call_api(rxnorm_entities, "rxnorm")
             
+            # First pass: match what we can
+            unmatched_rxnorm = []
             for ent_info in rxnorm_entities:
                 matched = False
                 for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
@@ -1003,22 +1013,30 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
                         break
                 
                 if not matched:
-                    # Try fallback to SNOMED for this entity
-                    try:
-                        fallback_result = batch_call_api([ent_info], "snomed")
+                    unmatched_rxnorm.append(ent_info)
+            
+            # Second pass: batch fallback to SNOMED for ALL unmatched
+            if unmatched_rxnorm:
+                try:
+                    snomed_fallback_results = batch_call_api(unmatched_rxnorm, "snomed")
+                    
+                    for ent_info in unmatched_rxnorm:
                         matched_fallback = False
                         for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
-                            if text_variant in fallback_result:
-                                results[ent_info['key']] = fallback_result[text_variant]
+                            if text_variant in snomed_fallback_results:
+                                results[ent_info['key']] = snomed_fallback_results[text_variant]
                                 matched_fallback = True
                                 break
                         
                         if not matched_fallback:
+                            # No match in either API - use fallback ID
                             results[ent_info['key']] = {
                                 'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
                                 'standard_name': ent_info['name'].title()
                             }
-                    except:
+                except Exception as e:
+                    print(f"  - ⚠️  SNOMED fallback batch failed: {e}")
+                    for ent_info in unmatched_rxnorm:
                         results[ent_info['key']] = {
                             'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
                             'standard_name': ent_info['name'].title()
