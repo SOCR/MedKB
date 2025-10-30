@@ -897,18 +897,18 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
         if not entities_batch:
             return {}
         
-        # Create a combined text with all entities, separated by newlines
-        # Use markers to track which entity is which
+        # Create a combined text with all entities
+        # Use newlines for better entity separation
         combined_text_parts = []
         for i, ent in enumerate(entities_batch):
-            # Add entity with context for better API recognition
-            combined_text_parts.append(f"{ent['expanded']} ({ent['type']})")
+            # Just use the entity name without type annotation for better AWS recognition
+            combined_text_parts.append(ent['expanded'])
         
-        combined_text = ". ".join(combined_text_parts)
+        # Use newlines instead of periods for cleaner separation
+        combined_text = "\n".join(combined_text_parts)
         
         # Limit text to AWS maximum (20,000 bytes)
         if len(combined_text.encode('utf-8')) > 20000:
-            # Truncate if too large
             combined_text = combined_text[:18000]
         
         try:
@@ -923,20 +923,32 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
             
             # Extract all entities and their concepts from the response
             all_concepts_by_text = {}
+            aws_found_texts = []
+            
             for entity in response.get('Entities', []):
-                entity_text = entity.get('Text', '').lower().strip()
+                entity_text = entity.get('Text', '').strip()
                 concepts = entity.get(concept_key, [])
                 
                 if concepts:
                     # Find best concept for this entity
                     best_concept = max(concepts, key=lambda c: c.get('Score', 0))
                     if best_concept.get('Score', 0) >= MIN_CONFIDENCE_SCORE:
-                        all_concepts_by_text[entity_text] = {
+                        # Store with normalized key (lowercase, no extra spaces)
+                        normalized_key = entity_text.lower().strip()
+                        all_concepts_by_text[normalized_key] = {
                             'ontology_id': f"{api_prefix}:{best_concept['Code']}",
                             'standard_name': clean_description(best_concept['Description']),
                             '_confidence': best_concept['Score'],
                             '_api_used': api_name
                         }
+                        aws_found_texts.append(entity_text)
+            
+            # Debug: Show what AWS actually found
+            if len(all_concepts_by_text) < len(entities_batch):
+                sent_names = [e['name'] for e in entities_batch]
+                print(f"    🔍 AWS {api_name.upper()}: sent {len(entities_batch)} entities, got {len(all_concepts_by_text)} matches")
+                print(f"    📤 Sent: {', '.join(sent_names[:5])}{'...' if len(sent_names) > 5 else ''}")
+                print(f"    📥 Found: {', '.join(aws_found_texts[:5])}{'...' if len(aws_found_texts) > 5 else ''}")
             
             return all_concepts_by_text
             
@@ -949,15 +961,32 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
         try:
             snomed_results = batch_call_api(snomed_entities, "snomed")
             
-            # First pass: match what we can
+            # First pass: match what we can with flexible matching
             unmatched_snomed = []
             for ent_info in snomed_entities:
                 matched = False
-                for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
+                # Try multiple variations: expanded, original, stripped
+                text_variants = [
+                    ent_info['expanded'].lower().strip(),
+                    ent_info['name'].lower().strip(),
+                    ent_info['expanded'].lower().strip().rstrip('s'),  # Handle plurals
+                ]
+                
+                for text_variant in text_variants:
                     if text_variant in snomed_results:
                         results[ent_info['key']] = snomed_results[text_variant]
                         matched = True
                         break
+                
+                # If still not matched, try partial matching
+                if not matched:
+                    for aws_text, aws_result in snomed_results.items():
+                        # Check if AWS text is contained in our entity name or vice versa
+                        if (aws_text in ent_info['name'].lower() or 
+                            ent_info['name'].lower() in aws_text):
+                            results[ent_info['key']] = aws_result
+                            matched = True
+                            break
                 
                 if not matched:
                     unmatched_snomed.append(ent_info)
@@ -1002,15 +1031,31 @@ def batch_standardize_entities(entities: list, aws_client) -> dict:
         try:
             rxnorm_results = batch_call_api(rxnorm_entities, "rxnorm")
             
-            # First pass: match what we can
+            # First pass: match what we can with flexible matching
             unmatched_rxnorm = []
             for ent_info in rxnorm_entities:
                 matched = False
-                for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
+                # Try multiple variations
+                text_variants = [
+                    ent_info['expanded'].lower().strip(),
+                    ent_info['name'].lower().strip(),
+                    ent_info['expanded'].lower().strip().rstrip('s'),
+                ]
+                
+                for text_variant in text_variants:
                     if text_variant in rxnorm_results:
                         results[ent_info['key']] = rxnorm_results[text_variant]
                         matched = True
                         break
+                
+                # Try partial matching
+                if not matched:
+                    for aws_text, aws_result in rxnorm_results.items():
+                        if (aws_text in ent_info['name'].lower() or 
+                            ent_info['name'].lower() in aws_text):
+                            results[ent_info['key']] = aws_result
+                            matched = True
+                            break
                 
                 if not matched:
                     unmatched_rxnorm.append(ent_info)
@@ -1411,18 +1456,12 @@ def batch_get_synonyms(entities_data: list, umls_cursor) -> dict:
                     else:
                         results[entity_data['ontology_id']] = []
         
-        # Process BIOGRAPH entities (still individual text searches - these are rare)
+        # Process BIOGRAPH entities (skip slow text searches - these aren't in medical ontologies anyway)
         for entity_data in biograph_entities:
-            synonyms = get_synonyms_from_text_search(
-                entity_data['entity_name'], 
-                entity_data.get('entity_type', ''), 
-                umls_cursor
-            )
-            results[entity_data['ontology_id']] = synonyms
-            if synonyms:
-                print(f"    🔍 Found {len(synonyms)} synonyms via text search for '{entity_data['entity_name']}'")
-            else:
-                print(f"    ❌ No UMLS synonyms found for '{entity_data['entity_name']}'")
+            # Skip UMLS text search for entities not in SNOMED/RxNorm
+            # These are typically agricultural/veterinary terms not in medical databases
+            results[entity_data['ontology_id']] = []
+            # Removed slow text search: get_synonyms_from_text_search()
         
         # Process other entities
         for entity_data in other_entities:
