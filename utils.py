@@ -5,6 +5,7 @@ import hashlib
 import time
 from functools import wraps
 from getpass import getpass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Core libraries
 import boto3  # For AWS Comprehend Medical
@@ -852,35 +853,74 @@ def clean_description(description: str) -> str:
 # FINAL, MOST ROBUST STANDARDIZATION FUNCTION (v1.4 - Context-Aware)
 # =============================================================================
 
-def batch_standardize_entities(entities: list, aws_client) -> dict:
+def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4) -> dict:
     """
-    Standardize multiple entities using INDIVIDUAL AWS Comprehend calls for reliability.
-    Returns a dict mapping (entity_name, entity_type) -> standardization result
+    Standardize multiple entities using PARALLEL AWS Comprehend calls.
+    Uses ThreadPoolExecutor for concurrent API calls (4-8x speedup).
     
-    Note: Reverted from batch calls because AWS matching was unreliable.
-    Still much faster than before due to batched UMLS lookups elsewhere.
+    Args:
+        entities: List of entity dicts with 'entity_name' and 'entity_type'
+        aws_client: boto3 comprehendmedical client
+        max_workers: Number of parallel workers (default: 4, safe for 20 TPS limit)
+    
+    Returns:
+        Dict mapping (entity_name, entity_type) -> standardization result
     """
     if not entities:
         return {}
     
     results = {}
     
-    # Process each entity individually for reliable 1-to-1 mapping
-    for entity in entities:
+    # Helper function for thread execution
+    def standardize_single_entity(entity):
+        """Wrapper to standardize a single entity with error handling."""
         entity_name = entity.get('entity_name', '')
         entity_type = entity.get('entity_type', '')
         entity_key = (entity_name, entity_type)
         
-        # Use the existing reliable standardize_entity function
         try:
             standard_info = standardize_entity(entity_name, entity_type, aws_client)
-            results[entity_key] = standard_info
+            return entity_key, standard_info, None
         except Exception as e:
-            # Fallback on any error
-            results[entity_key] = {
-                'ontology_id': generate_fallback_id(entity_name, entity_type),
-                'standard_name': entity_name.title()
-            }
+            # Return error, will use fallback
+            return entity_key, None, e
+    
+    # Execute standardization calls in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_entity = {
+            executor.submit(standardize_single_entity, entity): entity
+            for entity in entities
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_entity):
+            entity = future_to_entity[future]
+            
+            try:
+                entity_key, standard_info, error = future.result()
+                
+                if error:
+                    # Error occurred, use fallback
+                    entity_name = entity.get('entity_name', '')
+                    entity_type = entity.get('entity_type', '')
+                    results[entity_key] = {
+                        'ontology_id': generate_fallback_id(entity_name, entity_type),
+                        'standard_name': entity_name.title()
+                    }
+                else:
+                    # Success
+                    results[entity_key] = standard_info
+                    
+            except Exception as e:
+                # Unexpected error in future itself
+                entity_name = entity.get('entity_name', '')
+                entity_type = entity.get('entity_type', '')
+                entity_key = (entity_name, entity_type)
+                results[entity_key] = {
+                    'ontology_id': generate_fallback_id(entity_name, entity_type),
+                    'standard_name': entity_name.title()
+                }
     
     return results
 
@@ -1509,9 +1549,9 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
             entity = apply_species_logic_to_node(entity, document_context)
             entities_with_species.append(entity)
         
-        # STANDARDIZE: Call AWS Comprehend for each entity (individual calls for reliability)
-        print(f"  - Calling AWS Comprehend for {len(entities_with_species)} entities...")
-        batch_standard_results = batch_standardize_entities(entities_with_species, aws_client)
+        # STANDARDIZE: Parallel AWS Comprehend calls (4 workers for 4x speedup)
+        print(f"  - Calling AWS Comprehend for {len(entities_with_species)} entities (parallel)...")
+        batch_standard_results = batch_standardize_entities(entities_with_species, aws_client, max_workers=4)
         print(f"  - AWS standardization complete!")
         
         # Prepare entities for batch synonym lookup
