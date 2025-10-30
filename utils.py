@@ -207,6 +207,87 @@ def initialize_llm():
 print("LLM initialization function defined.")
 
 
+def initialize_llm_lmstudio(base_url="http://127.0.0.1:1234/v1", model_name="qwen3-30b-a3b-2507"):
+    """
+    Initialize LM Studio local LLM server for medical entity extraction.
+    
+    Args:
+        base_url: LM Studio server URL (default: http://127.0.0.1:1234/v1)
+        model_name: Model identifier (for display/logging purposes)
+    
+    Returns:
+        A wrapper object compatible with LlamaIndex LLM interface
+    """
+    try:
+        from openai import OpenAI
+        
+        # Create OpenAI client pointing to LM Studio
+        client = OpenAI(
+            base_url=base_url,
+            api_key="lm-studio"  # Dummy key for local server
+        )
+        
+        # Test connection
+        try:
+            models = client.models.list()
+            available_models = [m.id for m in models.data]
+            print(f"✅ LM Studio server connected: {base_url}")
+            print(f"   Available models: {', '.join(available_models)}")
+        except Exception as e:
+            print(f"⚠️  Could not list models (server may be busy): {e}")
+        
+        # Create a wrapper to make it compatible with LlamaIndex interface
+        class LMStudioLLM:
+            def __init__(self, client, model_name):
+                self.client = client
+                self.model_name = model_name
+                self.temperature = 0.7
+                self.max_tokens = 2048
+                
+            def complete(self, prompt, **kwargs):
+                """Complete a prompt (LlamaIndex-compatible interface)"""
+                # Override defaults with any provided kwargs
+                temperature = kwargs.get('temperature', self.temperature)
+                max_tokens = kwargs.get('max_tokens', self.max_tokens)
+                
+                try:
+                    response = self.client.chat.completions.create(
+                        model=self.model_name,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        top_p=0.8,
+                        top_k=20,
+                    )
+                    
+                    # Create a response object with .text attribute
+                    class Response:
+                        def __init__(self, text):
+                            self.text = text
+                    
+                    return Response(response.choices[0].message.content)
+                    
+                except Exception as e:
+                    print(f"  - ❌ LM Studio API error: {e}")
+                    raise
+        
+        llm_wrapper = LMStudioLLM(client, model_name)
+        print(f"✅ LLM initialized successfully (LM Studio - {model_name})")
+        print(f"   Server: {base_url}")
+        print(f"   Settings: temp={llm_wrapper.temperature}, max_tokens={llm_wrapper.max_tokens}")
+        return llm_wrapper
+        
+    except ImportError:
+        print("❌ OpenAI package not installed. Run: pip install openai")
+        raise
+    except Exception as e:
+        print(f"❌ Error initializing LM Studio LLM: {e}")
+        print(f"   Make sure LM Studio server is running at {base_url}")
+        raise
+
+print("LM Studio LLM initialization function defined.")
+
+
 # =============================================================================
 # DOCUMENT CONTEXT EXTRACTION FUNCTIONS
 # =============================================================================

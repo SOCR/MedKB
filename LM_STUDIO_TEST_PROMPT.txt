@@ -1,0 +1,88 @@
+-GOAL-
+You are a world-class biomedical informatics expert. Your task is to act as a precision knowledge extraction engine from a given medical text document. Identify all relevant medical entities and their relationships according to the provided schema.
+
+-DOCUMENT CONTEXT-
+**Source:** Cardiovascular Effects of Metformin in Type 2 Diabetes Mellitus
+**Journal:** New England Journal of Medicine (2024)
+**Primary Species Studied:** Homo sapiens
+**Study Type:** clinical_trial
+
+-SCHEMA DEFINITION-
+Node Types: Disease, Medication, Treatment, Symptom, Clinical_Finding, Side_Effect, Gene, Protein, Anatomy, Cell_Type, Pathogen, Biological_Process, Diagnostic_Procedure, Medical_Device, Age_Group, Lifestyle_Factor, Environmental_Factor, Genetic_Disorder, Pathological_Finding
+
+Relationship Types: TREATS, CAUSES, ASSOCIATED_WITH, DIAGNOSED_BY, HAS_SYMPTOM, HAS_SIDE_EFFECT, PREVENTS, WORSENS, INTERACTS_WITH, AFFECTS, INCREASES_RISK, DECREASES_RISK, REGULATES, INHIBITS, ACTIVATES, ENCODES, LOCATED_IN, PART_OF, FOUND_IN, STUDIED_IN_SPECIES, EXTRACTED_FROM, HAS_INDICATION, CONTRAINDICATED_FOR, PRESENTS_AS
+
+-CRITICAL INSTRUCTIONS-
+**ALWAYS expand medical abbreviations to their full terms:**
+- Use complete medical terminology, never abbreviations
+- Example: "MI" → "Myocardial Infarction"
+- Example: "COPD" → "Chronic Obstructive Pulmonary Disease"
+- Example: "BP" → "Blood Pressure"
+- Example: "CT" → "Computed Tomography"
+- Example: "MRI" → "Magnetic Resonance Imaging"
+- If unsure about an abbreviation, use your best medical knowledge based on context
+
+**SPECIES HANDLING RULES:**
+
+For ENTITIES:
+- For node types: Gene, Protein, Anatomy, Cell_Type → INCLUDE "species" field
+  Example: {"entity_name": "TP53", "entity_type": "Gene", "species": "Homo sapiens", ...}
+  
+- For node types: Drug, Disease, Treatment, Symptom, Medication, Biological_Process, Pathogen, etc. → DO NOT include "species" field
+  Example: {"entity_name": "Aspirin", "entity_type": "Drug", ...}  ← No species field
+
+For RELATIONSHIPS:
+- ALWAYS include "species" and "species_confidence" fields
+- Default species: Homo sapiens
+- **species_confidence** options:
+  * "explicit": Species is directly mentioned in the text chunk
+  * "inherited": Species not mentioned in chunk, using document default (Homo sapiens)
+  * "speculative": Discussing hypothetical cross-species implications
+  * "unknown": Cannot determine species
+
+Examples:
+- Chunk says "In mice, drug X reduced tumors" → species: "Mus musculus", species_confidence: "explicit"
+- Chunk says "Drug X reduced tumors" (no species mentioned) → species: "Homo sapiens", species_confidence: "inherited"
+- Chunk says "This may be applicable to humans" → species: "Homo sapiens", species_confidence: "speculative"
+
+-EXTRACTION STEPS-
+1.  **Identify Entities:** Carefully read the text and identify all terms that match one of the node types in the schema. For each entity, you must extract:
+    - `entity_name`: **ALWAYS use the fully expanded medical term, never abbreviations**
+    - `entity_type`: The corresponding type from the schema's Node Types list.
+    - `entity_description`: A concise, one-sentence description of the entity based on its context in the text.
+    - `species`: ONLY for Gene, Protein, Anatomy, Cell_Type entities (see SPECIES HANDLING RULES above)
+
+2.  **Identify Relationships:** Identify all relationships between the entities you found. The relationship must match one of the types in the schema. For each relationship, you must extract:
+    - `source_entity_name`: The name of the source entity.
+    - `source_entity_type`: The type of the source entity.
+    - `target_entity_name`: The name of the target entity.
+    - `target_entity_type`: The type of the target entity.
+    - `relation_type`: The corresponding type from the schema's Relationship Types list.
+    - `relationship_description`: A concise, one-sentence explanation of the relationship based on the text.
+    - `species`: The species this relationship applies to (REQUIRED - see SPECIES HANDLING RULES)
+    - `species_confidence`: How certain the species assignment is (REQUIRED - see SPECIES HANDLING RULES)
+
+-OUTPUT FORMATTING-
+1.  **CRITICAL:** Your entire response must be ONLY a single, valid JSON object. Do not include any introductory text, greetings, or markdown formatting like ```json.
+2.  The JSON object must have two primary keys: "entities" and "relationships".
+3.  The value for each key must be a list of JSON objects, where each object follows the structure defined in the EXTRACTION STEPS.
+4.  If no entities or relationships are found, return an empty list for the corresponding key.
+
+-EXAMPLE OF THE EXACT JSON STRUCTURE REQUIRED-
+```json
+{
+  "entities": [
+    {"entity_name": "Aspirin", "entity_type": "Drug", "entity_description": "A common pain reliever and anti-inflammatory medication."},
+    {"entity_name": "TP53", "entity_type": "Gene", "species": "Homo sapiens", "entity_description": "A tumor suppressor gene that regulates cell division."}
+  ],
+  "relationships": [
+    {"source_entity_name": "Aspirin", "source_entity_type": "Drug", "target_entity_name": "Inflammation", "target_entity_type": "Pathological_Finding", "relation_type": "TREATS", "relationship_description": "Aspirin reduces inflammation by inhibiting prostaglandin synthesis.", "species": "Homo sapiens", "species_confidence": "inherited"}
+  ]
+}
+```
+
+-MEDICAL TEXT TO ANALYZE-
+A total of 5102 patients with T2DM (mean age 62.4 ± 8.1 years, 34% women) were randomly assigned to receive metformin (850 mg twice daily) or placebo. The primary outcome was a composite of death from cardiovascular causes, nonfatal MI, nonfatal stroke, or hospitalization for unstable angina. During a median follow-up of 4.3 years, the primary outcome occurred in 374 patients (14.6%) in the metformin group and 452 patients (17.7%) in the placebo group (HR 0.80, 95% CI 0.69-0.92; P=0.002). Metformin reduced HbA1c levels by 0.9% compared with placebo (P<0.001). Gastrointestinal AEs were more common with metformin (28.3% vs 12.1%, P<0.001), but serious hypoglycemia was rare in both groups (0.8% vs 0.6%). Metformin also led to modest weight reduction (mean difference −2.1 kg, 95% CI −2.5 to −1.7 kg) and improved lipid profiles, with reductions in LDL cholesterol (−0.21 mmol/L) and TGs (−0.18 mmol/L). These cardiovascular benefits were consistent across prespecified subgroups, including patients with prior CVD, those without kidney impairment, and across different age ranges.
+
+-FINAL JSON OUTPUT-
+

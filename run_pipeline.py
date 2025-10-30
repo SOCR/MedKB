@@ -31,6 +31,7 @@ from rich.table import Table
 # Import all functions from utils
 from utils import (
     initialize_llm,
+    initialize_llm_lmstudio,
     process_text_chunk,
     extract_document_context,
     create_source_node,
@@ -297,6 +298,10 @@ Examples:
                        help='Process all chunks (override test mode)')
     parser.add_argument('--batch-size', type=int, default=5,
                        help='Number of chunks to process per batch (default: 5)')
+    parser.add_argument('--use-lm-studio', action='store_true',
+                       help='Use local LM Studio server instead of AWS Bedrock (faster, free)')
+    parser.add_argument('--lm-studio-url', type=str, default='http://127.0.0.1:1234/v1',
+                       help='LM Studio server URL (default: http://127.0.0.1:1234/v1)')
     parser.add_argument('--data-directory', type=str, default='data_corpus/',
                        help='Directory containing documents to process (default: data_corpus/)')
     parser.add_argument('--single-document', type=str, default=None,
@@ -372,9 +377,13 @@ def main():
         neo4j_driver.verify_connectivity()
         print("  ✅ Neo4j database connected")
         
-        # 1d. Initialize LLM (AWS Bedrock Claude)
-        print("  🔧 Initializing LLM (AWS Bedrock Claude)...")
-        llm = initialize_llm()
+        # 1d. Initialize LLM (AWS Bedrock Claude or LM Studio)
+        if args.use_lm_studio:
+            print("  🔧 Initializing LLM (LM Studio local server)...")
+            llm = initialize_llm_lmstudio(base_url=args.lm_studio_url)
+        else:
+            print("  🔧 Initializing LLM (AWS Bedrock Claude)...")
+            llm = initialize_llm()
         
         # 1e. Initialize Embedding Model
         print("  🔧 Loading embedding model (this may take a minute)...")

@@ -18,6 +18,9 @@ sentence-transformers>=3.0.0
 llama-index-core>=0.13.0,<0.15.0
 llama-index-llms-bedrock>=0.4.0
 
+# Local LLM Support (for LM Studio)
+openai>=1.0.0  # For LM Studio OpenAI-compatible API
+
 # Scientific Computing
 numpy<2.0.0
 scipy<1.12.0
