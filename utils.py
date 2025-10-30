@@ -1289,6 +1289,175 @@ def get_synonyms_from_text_search(entity_name: str, entity_type: str, umls_curso
             pass
         return []
 
+def batch_get_synonyms(entities_data: list, umls_cursor) -> dict:
+    """
+    Batch synonym lookup for multiple entities with minimal DB queries.
+    
+    Args:
+        entities_data: List of dicts with {ontology_id, entity_name, entity_type}
+        umls_cursor: PostgreSQL cursor
+    
+    Returns:
+        Dict mapping ontology_id -> list of synonyms
+    """
+    if not umls_cursor or not entities_data:
+        return {}
+    
+    results = {}
+    
+    try:
+        # Group entities by type
+        snomed_entities = []
+        rxnorm_entities = []
+        biograph_entities = []
+        other_entities = []
+        
+        for entity_data in entities_data:
+            ont_id = entity_data['ontology_id']
+            if ont_id.startswith("SNOMEDCT:"):
+                snomed_entities.append(entity_data)
+            elif ont_id.startswith("RXNORM:"):
+                rxnorm_entities.append(entity_data)
+            elif ont_id.startswith("BIOGRAPH:"):
+                biograph_entities.append(entity_data)
+            else:
+                other_entities.append(entity_data)
+        
+        # Batch process SNOMED entities
+        if snomed_entities:
+            snomed_codes = [e['ontology_id'].replace("SNOMEDCT:", "") for e in snomed_entities]
+            
+            # Single query to get all CUIs
+            umls_cursor.execute("""
+                SELECT DISTINCT CODE, CUI 
+                FROM mrconso 
+                WHERE CODE = ANY(%s) AND SAB = 'SNOMEDCT_US'
+            """, (snomed_codes,))
+            
+            code_to_cui = {row[0]: row[1] for row in umls_cursor.fetchall()}
+            
+            if code_to_cui:
+                # Single query to get all synonyms for all CUIs
+                cuis = list(code_to_cui.values())
+                umls_cursor.execute("""
+                    SELECT DISTINCT CUI, STR, TTY, LENGTH(STR) as str_length,
+                           CASE WHEN TTY = 'PT' THEN 1 ELSE 2 END as tty_priority
+                    FROM mrconso 
+                    WHERE CUI = ANY(%s)
+                      AND LAT = 'ENG' 
+                      AND SUPPRESS = 'N'
+                    ORDER BY CUI, tty_priority, str_length
+                """, (cuis,))
+                
+                # Group synonyms by CUI
+                cui_to_synonyms = {}
+                for cui, str_val, tty, str_length, tty_priority in umls_cursor.fetchall():
+                    if cui not in cui_to_synonyms:
+                        cui_to_synonyms[cui] = []
+                    if len(cui_to_synonyms[cui]) < 20:  # Limit to 20 per entity
+                        cui_to_synonyms[cui].append(str_val)
+                
+                # Map back to ontology IDs
+                for entity_data in snomed_entities:
+                    code = entity_data['ontology_id'].replace("SNOMEDCT:", "")
+                    cui = code_to_cui.get(code)
+                    if cui and cui in cui_to_synonyms:
+                        results[entity_data['ontology_id']] = cui_to_synonyms[cui]
+                        print(f"    📖 Found {len(cui_to_synonyms[cui])} synonyms via SNOMED CUI {cui}")
+                    else:
+                        results[entity_data['ontology_id']] = []
+        
+        # Batch process RxNorm entities
+        if rxnorm_entities:
+            rxnorm_codes = [e['ontology_id'].replace("RXNORM:", "") for e in rxnorm_entities]
+            
+            # Single query to get all CUIs
+            umls_cursor.execute("""
+                SELECT DISTINCT CODE, CUI 
+                FROM mrconso 
+                WHERE CODE = ANY(%s) AND SAB = 'RXNORM'
+            """, (rxnorm_codes,))
+            
+            code_to_cui = {row[0]: row[1] for row in umls_cursor.fetchall()}
+            
+            if code_to_cui:
+                # Single query to get all synonyms for all CUIs
+                cuis = list(code_to_cui.values())
+                umls_cursor.execute("""
+                    SELECT DISTINCT CUI, STR, TTY, LENGTH(STR) as str_length,
+                           CASE WHEN TTY = 'PT' THEN 1 ELSE 2 END as tty_priority
+                    FROM mrconso 
+                    WHERE CUI = ANY(%s)
+                      AND LAT = 'ENG' 
+                      AND SUPPRESS = 'N'
+                    ORDER BY CUI, tty_priority, str_length
+                """, (cuis,))
+                
+                # Group synonyms by CUI
+                cui_to_synonyms = {}
+                for cui, str_val, tty, str_length, tty_priority in umls_cursor.fetchall():
+                    if cui not in cui_to_synonyms:
+                        cui_to_synonyms[cui] = []
+                    if len(cui_to_synonyms[cui]) < 20:
+                        cui_to_synonyms[cui].append(str_val)
+                
+                # Map back to ontology IDs
+                for entity_data in rxnorm_entities:
+                    code = entity_data['ontology_id'].replace("RXNORM:", "")
+                    cui = code_to_cui.get(code)
+                    if cui and cui in cui_to_synonyms:
+                        results[entity_data['ontology_id']] = cui_to_synonyms[cui]
+                        print(f"    📖 Found {len(cui_to_synonyms[cui])} synonyms via RxNorm CUI {cui}")
+                    else:
+                        results[entity_data['ontology_id']] = []
+        
+        # Process BIOGRAPH entities (still individual text searches - these are rare)
+        for entity_data in biograph_entities:
+            synonyms = get_synonyms_from_text_search(
+                entity_data['entity_name'], 
+                entity_data.get('entity_type', ''), 
+                umls_cursor
+            )
+            results[entity_data['ontology_id']] = synonyms
+            if synonyms:
+                print(f"    🔍 Found {len(synonyms)} synonyms via text search for '{entity_data['entity_name']}'")
+            else:
+                print(f"    ❌ No UMLS synonyms found for '{entity_data['entity_name']}'")
+        
+        # Process other entities
+        for entity_data in other_entities:
+            # Try direct CUI lookup
+            umls_cursor.execute("""
+                SELECT DISTINCT STR 
+                FROM mrconso 
+                WHERE CUI = %s 
+                  AND LAT = 'ENG' 
+                  AND SUPPRESS = 'N'
+                LIMIT 20
+            """, (entity_data['ontology_id'],))
+            
+            synonyms = [row[0] for row in umls_cursor.fetchall()]
+            
+            # Fallback to text search if no CUI match
+            if not synonyms and entity_data.get('entity_name'):
+                synonyms = get_synonyms_from_text_search(
+                    entity_data['entity_name'],
+                    entity_data.get('entity_type', ''),
+                    umls_cursor
+                )
+            
+            results[entity_data['ontology_id']] = synonyms
+    
+    except Exception as e:
+        print(f"  - ⚠️  Error in batch synonym lookup: {e}")
+        try:
+            umls_cursor.connection.rollback()
+        except:
+            pass
+    
+    return results
+
+
 def get_synonyms(ontology_id: str, umls_cursor, original_entity_name: str = None, entity_type: str = None) -> list:
     """
     HYBRID synonym lookup function with comprehensive coverage:
@@ -1525,15 +1694,17 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
         batch_standard_results = batch_standardize_entities(entities_with_species, aws_client)
         print(f"  - Batch standardization complete!")
         
-        # Now process each entity with pre-computed standardization
+        # Prepare entities for batch synonym lookup
+        entities_for_synonym_lookup = []
+        entity_ontology_map = {}  # Map entity_key to final ontology_id
+        
+        # First pass: compute ontology IDs and print results
         for entity in entities_with_species:
-            # Use a tuple to handle cases where the same name might have different types
             entity_key = (entity['entity_name'], entity['entity_type'])
 
             # Get pre-computed standardization result from batch
             standard_info = batch_standard_results.get(entity_key)
             if not standard_info:
-                # Fallback if somehow not in batch results
                 standard_info = {
                     'ontology_id': generate_fallback_id(entity['entity_name'], entity['entity_type']),
                     'standard_name': entity['entity_name'].title()
@@ -1552,15 +1723,33 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
                 species_suffix = entity['species'].replace(' ', '_').replace('(', '').replace(')', '')
                 if species_suffix not in ontology_id:
                     ontology_id = f"{ontology_id}_{species_suffix}"
+            
+            entity['_final_ontology_id'] = ontology_id
+            entity['_standard_info'] = standard_info
+            entity_ontology_map[entity_key] = ontology_id
+            
+            # Collect unique entities for synonym lookup
+            if ontology_id not in enriched_nodes:
+                entities_for_synonym_lookup.append({
+                    'ontology_id': ontology_id,
+                    'entity_name': entity['entity_name'],
+                    'entity_type': entity['entity_type']
+                })
+        
+        # BATCH SYNONYM LOOKUP: Single call for all entities
+        print(f"  - Batch calling UMLS for synonyms...")
+        batch_synonyms = batch_get_synonyms(entities_for_synonym_lookup, umls_cursor)
+        
+        # Second pass: build nodes with pre-fetched synonyms
+        for entity in entities_with_species:
+            entity_key = (entity['entity_name'], entity['entity_type'])
+            ontology_id = entity['_final_ontology_id']
+            standard_info = entity['_standard_info']
 
             if ontology_id not in enriched_nodes:
-                # Use hybrid synonym lookup with original entity information
-                synonyms = get_synonyms(
-                    ontology_id=ontology_id,
-                    umls_cursor=umls_cursor,
-                    original_entity_name=entity['entity_name'],
-                    entity_type=entity['entity_type']
-                )
+                # Get pre-fetched synonyms
+                synonyms = batch_synonyms.get(ontology_id, [])
+                
                 summary = f"Concept: {standard_info['standard_name']}. Description: {entity['entity_description']}"
                 embedding = get_embedding(summary, embedding_model)
 
@@ -1586,6 +1775,8 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
                 
                 # Clean up internal flags
                 entity.pop('_needs_species_suffix', None)
+                entity.pop('_final_ontology_id', None)
+                entity.pop('_standard_info', None)
                 
                 enriched_nodes[ontology_id] = node_data
             entity_to_id_map[entity_key] = ontology_id
