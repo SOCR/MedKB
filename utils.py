@@ -257,7 +257,7 @@ def initialize_llm_lmstudio(base_url="http://127.0.0.1:1234/v1", model_name="qwe
                         temperature=temperature,
                         max_tokens=max_tokens,
                         top_p=0.8,
-                        top_k=20,
+                        # Note: top_k not supported by LM Studio's OpenAI-compatible API
                     )
                     
                     # Create a response object with .text attribute
