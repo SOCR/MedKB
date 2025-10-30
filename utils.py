@@ -854,252 +854,33 @@ def clean_description(description: str) -> str:
 
 def batch_standardize_entities(entities: list, aws_client) -> dict:
     """
-    Batch standardize multiple entities with a single or minimal AWS Comprehend calls.
-    
+    Standardize multiple entities using INDIVIDUAL AWS Comprehend calls for reliability.
     Returns a dict mapping (entity_name, entity_type) -> standardization result
+    
+    Note: Reverted from batch calls because AWS matching was unreliable.
+    Still much faster than before due to batched UMLS lookups elsewhere.
     """
     if not entities:
         return {}
     
-    # Group entities by API type
-    snomed_entities = []
-    rxnorm_entities = []
-    other_entities = []
+    results = {}
     
+    # Process each entity individually for reliable 1-to-1 mapping
     for entity in entities:
         entity_name = entity.get('entity_name', '')
         entity_type = entity.get('entity_type', '')
+        entity_key = (entity_name, entity_type)
         
-        # Expand abbreviations
-        expanded_name = ABBREVIATION_MAP.get(entity_name.upper(), entity_name)
-        primary_api = ENTITY_TYPE_TO_API_MAP.get(entity_type)
-        
-        entity_info = {
-            'name': entity_name,
-            'type': entity_type,
-            'expanded': expanded_name,
-            'key': (entity_name, entity_type)
-        }
-        
-        if primary_api == "snomed":
-            snomed_entities.append(entity_info)
-        elif primary_api == "rxnorm":
-            rxnorm_entities.append(entity_info)
-        else:
-            other_entities.append(entity_info)
-    
-    results = {}
-    
-    # Helper function to process a batch of entities with one API call
-    @retry_on_failure(max_retries=2, initial_delay=1.0, backoff_factor=2.0)
-    def batch_call_api(entities_batch, api_name):
-        """Call AWS Comprehend once for a batch of entities."""
-        if not entities_batch:
-            return {}
-        
-        # Create a combined text with all entities
-        # Use newlines for better entity separation
-        combined_text_parts = []
-        for i, ent in enumerate(entities_batch):
-            # Just use the entity name without type annotation for better AWS recognition
-            combined_text_parts.append(ent['expanded'])
-        
-        # Use newlines instead of periods for cleaner separation
-        combined_text = "\n".join(combined_text_parts)
-        
-        # Limit text to AWS maximum (20,000 bytes)
-        if len(combined_text.encode('utf-8')) > 20000:
-            combined_text = combined_text[:18000]
-        
+        # Use the existing reliable standardize_entity function
         try:
-            if api_name == "snomed":
-                response = aws_client.infer_snomedct(Text=combined_text)
-                concept_key = 'SNOMEDCTConcepts'
-                api_prefix = 'SNOMEDCT'
-            else:  # rxnorm
-                response = aws_client.infer_rx_norm(Text=combined_text)
-                concept_key = 'RxNormConcepts'
-                api_prefix = 'RXNORM'
-            
-            # Extract all entities and their concepts from the response
-            all_concepts_by_text = {}
-            aws_found_texts = []
-            
-            for entity in response.get('Entities', []):
-                entity_text = entity.get('Text', '').strip()
-                concepts = entity.get(concept_key, [])
-                
-                if concepts:
-                    # Find best concept for this entity
-                    best_concept = max(concepts, key=lambda c: c.get('Score', 0))
-                    if best_concept.get('Score', 0) >= MIN_CONFIDENCE_SCORE:
-                        # Store with normalized key (lowercase, no extra spaces)
-                        normalized_key = entity_text.lower().strip()
-                        all_concepts_by_text[normalized_key] = {
-                            'ontology_id': f"{api_prefix}:{best_concept['Code']}",
-                            'standard_name': clean_description(best_concept['Description']),
-                            '_confidence': best_concept['Score'],
-                            '_api_used': api_name
-                        }
-                        aws_found_texts.append(entity_text)
-            
-            # Debug: Show what AWS actually found
-            if len(all_concepts_by_text) < len(entities_batch):
-                sent_names = [e['name'] for e in entities_batch]
-                print(f"    🔍 AWS {api_name.upper()}: sent {len(entities_batch)} entities, got {len(all_concepts_by_text)} matches")
-                print(f"    📤 Sent: {', '.join(sent_names[:5])}{'...' if len(sent_names) > 5 else ''}")
-                print(f"    📥 Found: {', '.join(aws_found_texts[:5])}{'...' if len(aws_found_texts) > 5 else ''}")
-            
-            return all_concepts_by_text
-            
+            standard_info = standardize_entity(entity_name, entity_type, aws_client)
+            results[entity_key] = standard_info
         except Exception as e:
-            print(f"  - ⚠️  Batch AWS {api_name.upper()} call failed: {e}")
-            return {}
-    
-    # Process SNOMED entities in batch
-    if snomed_entities:
-        try:
-            snomed_results = batch_call_api(snomed_entities, "snomed")
-            
-            # First pass: match what we can with flexible matching
-            unmatched_snomed = []
-            for ent_info in snomed_entities:
-                matched = False
-                # Try multiple variations: expanded, original, stripped
-                text_variants = [
-                    ent_info['expanded'].lower().strip(),
-                    ent_info['name'].lower().strip(),
-                    ent_info['expanded'].lower().strip().rstrip('s'),  # Handle plurals
-                ]
-                
-                for text_variant in text_variants:
-                    if text_variant in snomed_results:
-                        results[ent_info['key']] = snomed_results[text_variant]
-                        matched = True
-                        break
-                
-                # If still not matched, try partial matching
-                if not matched:
-                    for aws_text, aws_result in snomed_results.items():
-                        # Check if AWS text is contained in our entity name or vice versa
-                        if (aws_text in ent_info['name'].lower() or 
-                            ent_info['name'].lower() in aws_text):
-                            results[ent_info['key']] = aws_result
-                            matched = True
-                            break
-                
-                if not matched:
-                    unmatched_snomed.append(ent_info)
-            
-            # Second pass: batch fallback to RxNorm for ALL unmatched
-            if unmatched_snomed:
-                try:
-                    rxnorm_fallback_results = batch_call_api(unmatched_snomed, "rxnorm")
-                    
-                    for ent_info in unmatched_snomed:
-                        matched_fallback = False
-                        for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
-                            if text_variant in rxnorm_fallback_results:
-                                results[ent_info['key']] = rxnorm_fallback_results[text_variant]
-                                matched_fallback = True
-                                break
-                        
-                        if not matched_fallback:
-                            # No match in either API - use fallback ID
-                            results[ent_info['key']] = {
-                                'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                                'standard_name': ent_info['name'].title()
-                            }
-                except Exception as e:
-                    print(f"  - ⚠️  RxNorm fallback batch failed: {e}")
-                    for ent_info in unmatched_snomed:
-                        results[ent_info['key']] = {
-                            'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                            'standard_name': ent_info['name'].title()
-                        }
-        except Exception as e:
-            print(f"  - ⚠️  Error processing SNOMED batch: {e}")
-            # Fallback for all
-            for ent_info in snomed_entities:
-                results[ent_info['key']] = {
-                    'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                    'standard_name': ent_info['name'].title()
-                }
-    
-    # Process RxNorm entities in batch
-    if rxnorm_entities:
-        try:
-            rxnorm_results = batch_call_api(rxnorm_entities, "rxnorm")
-            
-            # First pass: match what we can with flexible matching
-            unmatched_rxnorm = []
-            for ent_info in rxnorm_entities:
-                matched = False
-                # Try multiple variations
-                text_variants = [
-                    ent_info['expanded'].lower().strip(),
-                    ent_info['name'].lower().strip(),
-                    ent_info['expanded'].lower().strip().rstrip('s'),
-                ]
-                
-                for text_variant in text_variants:
-                    if text_variant in rxnorm_results:
-                        results[ent_info['key']] = rxnorm_results[text_variant]
-                        matched = True
-                        break
-                
-                # Try partial matching
-                if not matched:
-                    for aws_text, aws_result in rxnorm_results.items():
-                        if (aws_text in ent_info['name'].lower() or 
-                            ent_info['name'].lower() in aws_text):
-                            results[ent_info['key']] = aws_result
-                            matched = True
-                            break
-                
-                if not matched:
-                    unmatched_rxnorm.append(ent_info)
-            
-            # Second pass: batch fallback to SNOMED for ALL unmatched
-            if unmatched_rxnorm:
-                try:
-                    snomed_fallback_results = batch_call_api(unmatched_rxnorm, "snomed")
-                    
-                    for ent_info in unmatched_rxnorm:
-                        matched_fallback = False
-                        for text_variant in [ent_info['expanded'].lower(), ent_info['name'].lower()]:
-                            if text_variant in snomed_fallback_results:
-                                results[ent_info['key']] = snomed_fallback_results[text_variant]
-                                matched_fallback = True
-                                break
-                        
-                        if not matched_fallback:
-                            # No match in either API - use fallback ID
-                            results[ent_info['key']] = {
-                                'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                                'standard_name': ent_info['name'].title()
-                            }
-                except Exception as e:
-                    print(f"  - ⚠️  SNOMED fallback batch failed: {e}")
-                    for ent_info in unmatched_rxnorm:
-                        results[ent_info['key']] = {
-                            'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                            'standard_name': ent_info['name'].title()
-                        }
-        except Exception as e:
-            print(f"  - ⚠️  Error processing RxNorm batch: {e}")
-            for ent_info in rxnorm_entities:
-                results[ent_info['key']] = {
-                    'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-                    'standard_name': ent_info['name'].title()
-                }
-    
-    # Process other entities (no AWS API)
-    for ent_info in other_entities:
-        results[ent_info['key']] = {
-            'ontology_id': generate_fallback_id(ent_info['name'], ent_info['type']),
-            'standard_name': ent_info['name'].title()
-        }
+            # Fallback on any error
+            results[entity_key] = {
+                'ontology_id': generate_fallback_id(entity_name, entity_type),
+                'standard_name': entity_name.title()
+            }
     
     return results
 
@@ -1728,10 +1509,10 @@ def process_text_chunk(text_chunk: str, document_context: dict, llm, aws_client,
             entity = apply_species_logic_to_node(entity, document_context)
             entities_with_species.append(entity)
         
-        # BATCH STANDARDIZE: Call AWS Comprehend once for all entities
-        print(f"  - Batch calling AWS Comprehend for {len(entities_with_species)} entities...")
+        # STANDARDIZE: Call AWS Comprehend for each entity (individual calls for reliability)
+        print(f"  - Calling AWS Comprehend for {len(entities_with_species)} entities...")
         batch_standard_results = batch_standardize_entities(entities_with_species, aws_client)
-        print(f"  - Batch standardization complete!")
+        print(f"  - AWS standardization complete!")
         
         # Prepare entities for batch synonym lookup
         entities_for_synonym_lookup = []
