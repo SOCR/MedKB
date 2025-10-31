@@ -451,6 +451,7 @@ COMPREHENSIVE_SCHEMA = {
 
         # --- Biological & Genetic Concepts ---
         "Anatomy",              # A specific body part, organ, or physiological system (e.g., "liver", "abdominal aorta").
+        "Cell_Type",            # A specific type of cell (e.g., "T cells", "Beta cells", "Neurons", "Hepatocytes").
         "Pathogen",             # An infectious agent that causes disease (e.g., "Bacillus anthracis").
         "Gene",                 # A specific gene involved in biological processes or diseases (e.g., "NF2 gene").
         "Protein",              # A specific protein molecule.
@@ -462,6 +463,25 @@ COMPREHENSIVE_SCHEMA = {
         "Age_Group",            # A specific patient population defined by age (e.g., "children", "elderly").
         "Lifestyle_Factor",     # A behavioral factor that influences health (e.g., "Smoking", "Alcohol consumption").
         "Environmental_Factor", # An external, non-behavioral factor that influences health (e.g., "home environment", "asbestos exposure").
+        
+        # --- Technology & Systems ---
+        "Technology",           # Computational, AI, or technological methods used in healthcare (e.g., "Machine Learning", "Artificial Intelligence").
+        "Healthcare_System",    # Healthcare delivery institutions or organizational units (e.g., "Emergency Department", "Basic Health Units").
+        "Health_Policy",        # Government regulations, policies, or health programs (e.g., "National Emergency Care Policy").
+        
+        # --- Social & Demographic ---
+        "Gender",               # Biological sex or gender identity (e.g., "Male", "Female", "Non-binary"). Separated for clinical precision.
+        "Ethnicity",            # Ethnic or racial background (e.g., "Hispanic", "Caucasian", "Asian", "African American").
+        "Demographic_Factor",   # Other population characteristics not covered by Gender/Ethnicity (e.g., "Married", "Urban resident").
+        "Social_Program",       # Government or institutional support programs (e.g., "Family Allowance", "Medicare").
+        "Social_Determinant",   # Socioeconomic factors affecting health outcomes (e.g., "Poverty", "Education Level", "Income Inequality").
+        "Geographic_Location",  # Specific places or areas relevant to health (e.g., "Urban Area", "Rural Setting", "Pelotas City").
+        
+        # --- Measurement & Quantification ---
+        "Biomarker",            # Measurable biological indicators (e.g., "HbA1c", "Blood pressure", "PSA", "CD4 count", "Troponin").
+        "Clinical_Outcome",     # Study endpoints or clinical results (e.g., "Mortality", "Disease-free survival", "Remission", "Quality of life").
+        "Dosage",               # Medication amounts and administration schedules (e.g., "10mg daily", "500mg twice daily", "Loading dose").
+        "Statistical_Measure",  # Research metrics and statistical concepts (e.g., "Odds Ratio", "P-value", "Hazard Ratio", "Sensitivity").
     ],
     "relationship_types": [
         # --- Hierarchical & Definitional ---
@@ -492,6 +512,26 @@ COMPREHENSIVE_SCHEMA = {
         # --- Contextual Relationships ---
         "STUDIED_IN",           # Connects a concept (like a drug or treatment) to the clinical study that investigated it.
         "OCCURS_IN_AGE_GROUP",  # Connects a disease to a specific age population.
+        
+        # --- Technology & System Relationships ---
+        "UTILIZES",             # Connects a study/system to the technology it employs (e.g., (:Study)-[:UTILIZES]->(:Machine_Learning)).
+        "PROVIDED_BY",          # Connects a healthcare service to the system that delivers it (e.g., (:Emergency_Care)-[:PROVIDED_BY]->(:Hospital)).
+        "REGULATED_BY",         # Connects a healthcare entity to the policy that governs it (e.g., (:Emergency_Services)-[:REGULATED_BY]->(:Health_Policy)).
+        
+        # --- Social & Demographic Relationships ---
+        "ELIGIBLE_FOR",         # Connects a demographic group to a program they can access (e.g., (:Elderly)-[:ELIGIBLE_FOR]->(:Medicare)).
+        "INFLUENCED_BY",        # Connects a health outcome to a social determinant (e.g., (:Diabetes_Prevalence)-[:INFLUENCED_BY]->(:Poverty)).
+        "LOCATED_IN",           # Connects an entity to its geographic location (e.g., (:Hospital)-[:LOCATED_IN]->(:Urban_Area)).
+        "OCCURS_MORE_IN",       # Connects a disease to a gender/ethnicity with higher prevalence (e.g., (:Breast_Cancer)-[:OCCURS_MORE_IN]->(:Female)).
+        
+        # --- Measurement & Quantification Relationships ---
+        "MEASURED_BY",          # Connects a disease/condition to a biomarker used to measure it (e.g., (:Diabetes)-[:MEASURED_BY]->(:HbA1c)).
+        "INDICATES",            # Connects a biomarker to what it signifies (e.g., (:Elevated_PSA)-[:INDICATES]->(:Prostate_Cancer)).
+        "MONITORED_BY",         # Connects a treatment to a biomarker used to track response (e.g., (:Chemotherapy)-[:MONITORED_BY]->(:Tumor_Markers)).
+        "IMPROVES_OUTCOME",     # Connects a treatment to a positive clinical outcome (e.g., (:Immunotherapy)-[:IMPROVES_OUTCOME]->(:Survival)).
+        "WORSENS_OUTCOME",      # Connects a risk factor to a negative outcome (e.g., (:Smoking)-[:WORSENS_OUTCOME]->(:Mortality)).
+        "ADMINISTERED_AT",      # Connects a medication to its dosage regimen (e.g., (:Aspirin)-[:ADMINISTERED_AT]->(:81mg_daily)).
+        "QUANTIFIED_BY",        # Connects a relationship/finding to its statistical measure (e.g., (:Risk_Association)-[:QUANTIFIED_BY]->(:Odds_Ratio)).
     ]
 }
 
@@ -641,6 +681,7 @@ ENTITY_TYPE_TO_API_MAP = {
     
     # Biological & Genetic Concepts - SNOMED CT (best guess)
     "Anatomy": "snomed",
+    "Cell_Type": "snomed",            # Cellular biology (partial AWS match)
     "Pathogen": "snomed",             # Infectious organisms
     "Gene": "snomed",                 # Best guess, might fallback
     "Protein": "snomed",              # Best guess, might fallback  
@@ -652,8 +693,27 @@ ENTITY_TYPE_TO_API_MAP = {
     "Age_Group": "snomed",            # Demographics in SNOMED
     "Lifestyle_Factor": "snomed",     # Behavioral factors
     "Environmental_Factor": "snomed", # External factors
+    
+    # Technology & Systems - Likely not in medical ontologies (will fallback to BIOGRAPH)
+    "Technology": "snomed",           # Computational methods (unlikely AWS match)
+    "Healthcare_System": "snomed",    # Organizational entities (unlikely AWS match)
+    "Health_Policy": "snomed",        # Government regulations (unlikely AWS match)
+    
+    # Social & Demographic - SNOMED CT (some may fallback)
+    "Gender": "snomed",               # Biological sex (likely AWS match)
+    "Ethnicity": "snomed",            # Ethnic groups (partial AWS match)
+    "Demographic_Factor": "snomed",   # Other demographics
+    "Social_Program": "snomed",       # Welfare programs (unlikely AWS match)
+    "Social_Determinant": "snomed",   # Socioeconomic factors (partial match)
+    "Geographic_Location": "snomed",  # Places (unlikely AWS match)
+    
+    # Measurement & Quantification - Mixed
+    "Biomarker": "snomed",            # Lab tests, vital signs (likely AWS match)
+    "Clinical_Outcome": "snomed",     # Clinical results (partial AWS match)
+    "Dosage": "rxnorm",               # Medication dosing (RxNorm likely better)
+    "Statistical_Measure": "snomed",  # Research metrics (unlikely AWS match)
 }
-MIN_CONFIDENCE_SCORE = 0.75 # Higher threshold since we now try both APIs - filters false positives better
+MIN_CONFIDENCE_SCORE = 0.70 # Balanced threshold: captures "Diabetes" (0.72) while filtering noise
 
 def generate_fallback_id(entity_name: str, entity_type: str) -> str:
     """Creates a deterministic, project-specific ID for unlinked entities."""
@@ -1062,6 +1122,25 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
         "Age_Group": f"Patient population: {expanded_name}.",
         "Lifestyle_Factor": f"Patient lifestyle includes {expanded_name}.",
         "Environmental_Factor": f"Patient exposed to {expanded_name}.",
+        
+        # Technology & Systems (3 types)
+        "Technology": f"Healthcare utilizes {expanded_name} technology.",
+        "Healthcare_System": f"Patient received care at {expanded_name} facility.",
+        "Health_Policy": f"Healthcare governed by {expanded_name} policy.",
+        
+        # Social & Demographic (6 types)
+        "Gender": f"Patient gender: {expanded_name}.",
+        "Ethnicity": f"Patient ethnicity: {expanded_name}.",
+        "Demographic_Factor": f"Patient demographics: {expanded_name}.",
+        "Social_Program": f"Patient enrolled in {expanded_name} program.",
+        "Social_Determinant": f"Patient affected by {expanded_name} factor.",
+        "Geographic_Location": f"Patient resides in {expanded_name} area.",
+        
+        # Measurement & Quantification (4 types)
+        "Biomarker": f"Patient lab test: {expanded_name}.",
+        "Clinical_Outcome": f"Clinical outcome: {expanded_name}.",
+        "Dosage": f"Medication dosage: {expanded_name}.",
+        "Statistical_Measure": f"Statistical measure: {expanded_name}.",
     }
     
     # Use template if available, otherwise fall back to generic format
