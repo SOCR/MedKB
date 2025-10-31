@@ -1028,8 +1028,47 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
         fallback_id = generate_fallback_id(entity_name, entity_type)
         return {"ontology_id": fallback_id, "standard_name": entity_name.title()}
 
-    # 2. Create context-rich string for the API
-    text_for_api = f"{expanded_name} ({entity_type})"
+    # 2. Create context-rich clinical sentence for the API
+    # AWS Comprehend Medical works best with clinical text, not isolated terms
+    # Preserve entity type context with appropriate sentence structure
+    
+    # Map entity types to clinical sentence templates
+    # Covers all 19+ node types from COMPREHENSIVE_SCHEMA
+    entity_type_templates = {
+        # Clinical Concepts (5 types)
+        "Disease": f"Patient diagnosed with {expanded_name}.",
+        "Pathological_Finding": f"Patient presents with {expanded_name}.",
+        "Symptom": f"Patient reports {expanded_name}.",
+        "Clinical_Finding": f"Examination reveals {expanded_name}.",
+        "Side_Effect": f"Patient experienced {expanded_name} as adverse reaction.",
+        
+        # Interventions (4 types)
+        "Medication": f"Patient prescribed {expanded_name}.",
+        "Treatment": f"Patient received {expanded_name} treatment.",
+        "Diagnostic_Procedure": f"Patient underwent {expanded_name}.",
+        "Medical_Device": f"Procedure uses {expanded_name} device.",
+        
+        # Biological & Genetic Concepts (6 types)
+        "Anatomy": f"Examination of patient's {expanded_name}.",
+        "Pathogen": f"Patient infected with {expanded_name}.",
+        "Gene": f"Genetic testing for {expanded_name} gene.",
+        "Protein": f"Analysis of {expanded_name} protein levels.",
+        "Cell_Type": f"Analysis of {expanded_name} cells.",
+        "Genetic_Disorder": f"Patient has {expanded_name} genetic condition.",
+        "Biological_Process": f"Evaluation of {expanded_name} process.",
+        
+        # Contextual & Epidemiological Concepts (4 types)
+        "Clinical_Study": f"Research study on {expanded_name}.",
+        "Age_Group": f"Patient population: {expanded_name}.",
+        "Lifestyle_Factor": f"Patient lifestyle includes {expanded_name}.",
+        "Environmental_Factor": f"Patient exposed to {expanded_name}.",
+    }
+    
+    # Use template if available, otherwise fall back to generic format
+    text_for_api = entity_type_templates.get(
+        entity_type, 
+        f"Clinical assessment: {expanded_name}."
+    )
 
     # 3. Define API calling function (with retry logic)
     def try_api(api_name: str):
