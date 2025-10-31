@@ -985,6 +985,7 @@ def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4)
                     # Error occurred, use fallback
                     entity_name = entity.get('entity_name', '')
                     entity_type = entity.get('entity_type', '')
+                    print(f"  - ⚠️  AWS Comprehend error for '{entity_name}': {str(error)[:100]}")
                     results[entity_key] = {
                         'ontology_id': generate_fallback_id(entity_name, entity_type),
                         'standard_name': entity_name.title()
@@ -1006,6 +1007,7 @@ def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4)
     return results
 
 
+@retry_on_failure(max_retries=2, initial_delay=0.5, exceptions=(Exception,))
 def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
     """
     Enhanced standardization with dual-API fallback mechanism.
@@ -1015,6 +1017,8 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
     2. If no confident match, try secondary API (the other one)  
     3. Confidence scoring filters false positives
     4. Final fallback to deterministic ID
+    
+    Note: Has retry logic (2 retries) to handle AWS rate limiting/timeouts
     """
     # 1. Abbreviation Expansion
     expanded_name = ABBREVIATION_MAP.get(entity_name.upper(), entity_name)
