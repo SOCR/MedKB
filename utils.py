@@ -713,7 +713,7 @@ ENTITY_TYPE_TO_API_MAP = {
     "Dosage": "rxnorm",               # Medication dosing (RxNorm likely better)
     "Statistical_Measure": "snomed",  # Research metrics (unlikely AWS match)
 }
-MIN_CONFIDENCE_SCORE = 0.70 # Balanced threshold: captures "Diabetes" (0.72) while filtering noise
+MIN_CONFIDENCE_SCORE = 0.68 # Lowered to capture borderline cases like "Tumors" (0.69) after format optimization
 
 def generate_fallback_id(entity_name: str, entity_type: str) -> str:
     """Creates a deterministic, project-specific ID for unlinked entities."""
@@ -994,7 +994,7 @@ def clean_description(description: str) -> str:
 # FINAL, MOST ROBUST STANDARDIZATION FUNCTION (v1.4 - Context-Aware)
 # =============================================================================
 
-def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4) -> dict:
+def batch_standardize_entities(entities: list, aws_client, max_workers: int = 3) -> dict:
     """
     Standardize multiple entities using PARALLEL AWS Comprehend calls.
     Uses ThreadPoolExecutor for concurrent API calls (4-8x speedup).
@@ -1002,7 +1002,7 @@ def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4)
     Args:
         entities: List of entity dicts with 'entity_name' and 'entity_type'
         aws_client: boto3 comprehendmedical client
-        max_workers: Number of parallel workers (default: 4, safe for 20 TPS limit)
+        max_workers: Number of parallel workers (default: 3, conservative for throttling)
     
     Returns:
         Dict mapping (entity_name, entity_type) -> standardization result
@@ -1070,16 +1070,24 @@ def batch_standardize_entities(entities: list, aws_client, max_workers: int = 4)
 @retry_on_failure(max_retries=2, initial_delay=0.5, exceptions=(Exception,))
 def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
     """
-    Enhanced standardization with dual-API fallback mechanism.
+    Enhanced standardization with:
+    1. Dual-API fallback (SNOMED/RxNorm)
+    2. Rolling format fallback (tries alternative formats if confidence is borderline)
+    3. Rate limiting protection (small delay)
     
     Strategy:
-    1. Try primary API (SNOMED or RxNorm based on entity type)
-    2. If no confident match, try secondary API (the other one)  
-    3. Confidence scoring filters false positives
-    4. Final fallback to deterministic ID
+    - Try primary API with optimal format
+    - If borderline confidence (0.4-0.69), try alternative formats
+    - If still no match, try secondary API
+    - Final fallback to deterministic ID
     
     Note: Has retry logic (2 retries) to handle AWS rate limiting/timeouts
     """
+    import time
+    
+    # Small delay to reduce concurrent API pressure (helps with throttling)
+    time.sleep(0.05)  # 50ms delay
+    
     # 1. Abbreviation Expansion
     expanded_name = ABBREVIATION_MAP.get(entity_name.upper(), entity_name)
     primary_api = ENTITY_TYPE_TO_API_MAP.get(entity_type)
@@ -1088,11 +1096,7 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
         fallback_id = generate_fallback_id(entity_name, entity_type)
         return {"ontology_id": fallback_id, "standard_name": entity_name.title()}
 
-    # 2. Create context-rich clinical sentence for the API
-    # AWS Comprehend Medical works best with clinical text, not isolated terms
-    # Preserve entity type context with appropriate sentence structure
-    
-    # ENTITY-TYPE-DEPENDENT AWS INPUT FORMATTING
+    # 2. ENTITY-TYPE-DEPENDENT AWS INPUT FORMATTING
     # Based on comprehensive testing of 65 medical entities across 8 types
     # Different entity types require different input formats for optimal AWS recognition
     
@@ -1118,41 +1122,65 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
         "Medication", "Pathological_Finding"
     }
     
-    # Apply optimal formatting strategy based on entity type
-    if entity_type in clinical_sentence_types:
-        # Format 3: Clinical sentence (best for diseases)
+    # Define all three format functions
+    def format_just_name():
+        return expanded_name
+    
+    def format_name_plus_type():
+        return f"{expanded_name} ({entity_type})"
+    
+    def format_clinical_sentence():
         if entity_type == "Disease":
-            text_for_api = f"Patient diagnosed with {expanded_name}."
+            return f"Patient diagnosed with {expanded_name}."
         elif entity_type == "Genetic_Disorder":
-            text_for_api = f"Patient has {expanded_name} genetic condition."
+            return f"Patient has {expanded_name} genetic condition."
         elif entity_type == "Side_Effect":
-            text_for_api = f"Patient experienced {expanded_name} as adverse reaction."
+            return f"Patient experienced {expanded_name} as adverse reaction."
+        elif entity_type == "Pathological_Finding":
+            return f"Patient has {expanded_name} finding."
         else:
-            text_for_api = f"Patient diagnosed with {expanded_name}."
+            return f"Patient diagnosed with {expanded_name}."
+    
+    # Determine PRIMARY and FALLBACK format strategies
+    if entity_type in clinical_sentence_types:
+        # Primary: Clinical sentence, Fallback: Name+Type
+        primary_format = format_clinical_sentence()
+        fallback_formats = [format_name_plus_type()]
     
     elif entity_type in name_plus_type_types:
-        # Format 2: Name + Type (dominant winner for most types)
-        text_for_api = f"{expanded_name} ({entity_type})"
+        # Primary: Name+Type, Fallback: Clinical sentence
+        primary_format = format_name_plus_type()
+        fallback_formats = [format_clinical_sentence()]
     
     elif entity_type in just_name_types:
-        # Format 1: Just name (best for medications and pathological findings)
-        text_for_api = expanded_name
+        # Primary: Just name, Fallback: Name+Type (pathological findings often benefit)
+        primary_format = format_just_name()
+        fallback_formats = [format_name_plus_type(), format_clinical_sentence()]
     
     else:
-        # Fallback: use Name + Type (safest default based on overall 57% win rate)
-        text_for_api = f"{expanded_name} ({entity_type})"
+        # Default: Name+Type, Fallback: Clinical sentence
+        primary_format = format_name_plus_type()
+        fallback_formats = [format_clinical_sentence()]
+    
+    text_for_api = primary_format
 
-    # 3. Define API calling function (with retry logic)
-    def try_api(api_name: str):
-        """Helper function to call either SNOMED or RxNorm API with retry."""
+    # 3. Define API calling function (with retry logic and format flexibility)
+    def try_api(api_name: str, input_text: str = None):
+        """
+        Helper function to call either SNOMED or RxNorm API with retry.
+        Returns: (result_dict, confidence_score) or (None, 0.0)
+        """
+        if input_text is None:
+            input_text = text_for_api
+            
         @retry_on_failure(max_retries=2, initial_delay=1.0, backoff_factor=2.0)
         def call_aws_api():
             if api_name == "snomed":
-                response = aws_client.infer_snomedct(Text=text_for_api)
+                response = aws_client.infer_snomedct(Text=input_text)
                 concept_key = 'SNOMEDCTConcepts'
                 api_prefix = 'SNOMEDCT'
             elif api_name == "rxnorm":
-                response = aws_client.infer_rx_norm(Text=text_for_api)
+                response = aws_client.infer_rx_norm(Text=input_text)
                 concept_key = 'RxNormConcepts'
                 api_prefix = 'RXNORM'
             else:
@@ -1164,7 +1192,7 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
             entities, concept_key, api_prefix = call_aws_api()
             
             if not entities:
-                return None
+                return None, 0.0
 
             # Find the best concept from the response
             best_concept = None
@@ -1182,31 +1210,70 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
                     "standard_name": clean_description(best_concept['Description']),
                     "_confidence": highest_score,  # Internal tracking (underscore prefix)
                     "_api_used": api_name          # Internal tracking (underscore prefix)
-                }
+                }, highest_score
             elif best_concept:
-                # AWS found something but confidence too low
-                print(f"  - ⚠️  AWS found '{entity_name}' but confidence too low: {highest_score:.2f} < {MIN_CONFIDENCE_SCORE}")
-            return None
+                # AWS found something but confidence too low - return for potential format retry
+                return {
+                    "ontology_id": f"{api_prefix}:{best_concept['Code']}",
+                    "standard_name": clean_description(best_concept['Description']),
+                    "_confidence": highest_score,
+                    "_api_used": api_name,
+                    "_below_threshold": True  # Flag for rolling fallback
+                }, highest_score
+            return None, 0.0
 
         except Exception as e:
             print(f"  - AWS {api_name.upper()} API Error for '{entity_name}' (all retries failed): {e}")
-            return None
+            return None, 0.0
 
     try:
-        # 4. Try primary API first
-        result = try_api(primary_api)
-        if result:
+        # 4. Try primary API with primary format
+        result, confidence = try_api(primary_api, primary_format)
+        
+        if result and not result.get('_below_threshold'):
+            # Success! Confidence >= threshold
             print(f"  - ✅ {entity_name} → {result['ontology_id']} (primary {result['_api_used']}, conf: {result['_confidence']:.2f})")
             return result
-
-        # 5. Try secondary API as fallback
+        
+        # 5. ROLLING FORMAT FALLBACK: If borderline (0.4-0.69), try alternative formats
+        best_result = result  # Keep the best result so far
+        best_confidence = confidence
+        
+        if result and result.get('_below_threshold') and 0.4 <= confidence < MIN_CONFIDENCE_SCORE:
+            print(f"  - ⚠️  AWS found '{entity_name}' but confidence too low: {confidence:.2f} < {MIN_CONFIDENCE_SCORE}")
+            print(f"  - 🔄 Trying alternative format(s)...")
+            
+            for alt_format in fallback_formats:
+                result, confidence = try_api(primary_api, alt_format)
+                
+                if result and not result.get('_below_threshold'):
+                    # Success with alternative format!
+                    print(f"  - ✅ {entity_name} → {result['ontology_id']} (alt format, {result['_api_used']}, conf: {result['_confidence']:.2f})")
+                    return result
+                
+                # Track best result even if below threshold
+                if confidence > best_confidence:
+                    best_result = result
+                    best_confidence = confidence
+        
+        # 6. Try secondary API (SNOMED/RxNorm fallback)
         secondary_api = "rxnorm" if primary_api == "snomed" else "snomed"
-        result = try_api(secondary_api)
-        if result:
+        result, confidence = try_api(secondary_api, primary_format)
+        
+        if result and not result.get('_below_threshold'):
             print(f"  - ✅ {entity_name} → {result['ontology_id']} (fallback {result['_api_used']}, conf: {result['_confidence']:.2f})")
             return result
+        
+        if confidence > best_confidence:
+            best_result = result
+            best_confidence = confidence
 
-        # 6. No confident match found in either API - use fallback ID
+        # 7. If we have any result (even below threshold), use the best one
+        if best_result and best_confidence >= 0.65:  # Relaxed threshold for "best effort"
+            print(f"  - ⚠️  {entity_name} → {best_result['ontology_id']} (best effort, conf: {best_confidence:.2f})")
+            return best_result
+
+        # 8. No confident match found - use fallback ID
         fallback_id = generate_fallback_id(entity_name, entity_type)
         print(f"  - ⚠️  {entity_name} → {fallback_id} (no AWS match)")
         return {"ontology_id": fallback_id, "standard_name": entity_name.title()}
