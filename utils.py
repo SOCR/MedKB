@@ -1111,6 +1111,9 @@ def standardize_entity(entity_name: str, entity_type: str, aws_client) -> dict:
                     "_confidence": highest_score,  # Internal tracking (underscore prefix)
                     "_api_used": api_name          # Internal tracking (underscore prefix)
                 }
+            elif best_concept:
+                # AWS found something but confidence too low
+                print(f"  - ⚠️  AWS found '{entity_name}' but confidence too low: {highest_score:.2f} < {MIN_CONFIDENCE_SCORE}")
             return None
 
         except Exception as e:
